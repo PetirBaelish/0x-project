@@ -1,0 +1,4453 @@
+--!native
+--!optimize 2
+
+--[[
+    0x — High-Performance Enemy ESP, Combat Awareness, Security Monitor & Pixel UI Suite (v11.5 | build 051126a)
+
+    v11.5 changelog:
+    + NEW  SECURITY tab: live Security % and Reliability % computed from 11 self-checks
+           (kill switch, config integrity, API lock, single instance, safe limits, passive-only features,
+            render loop health, frame rate, footprint, storage, draw stack) + "should I worry?" verdict
+    + NEW  COMBAT tab (100% passive / read-only, zero input injection, zero remotes, zero game writes):
+           Health bars, Off-screen enemy arrows, Threat HUD (enemy count / nearest / dist / HP), Threat line
+    + NEW  Wheel-scrollable tab strip: 5 tabs, 3 visible at once. Scroll the mouse wheel over the menu
+           (or click the < > arrows) to reveal the remaining tabs. Active tab is always kept reachable.
+    + FIX  Analyzer error "Expected this to be '"!*t" | "*t"', but got 'string'":
+           clock now uses os.date("*t") (typed overload) instead of a runtime format string
+    + Structure: tab registry (string ids), UI:AddToggle / UI:AddSlider helpers, per-tab builders,
+                 Security:Register() check registry, FeatureRegistry, Guard() wrapper for all event handlers,
+                 Combat module is self-contained (Init / Layout / Update / Destroy)
+    + Stability: every input / player handler is pcall-guarded with rate-limited warnings,
+                 render loop keeps the menu clock alive even while the ESP is paused,
+                 health counters (errors / pauses / alloc failures / save+load results) feed the Security tab
+    + Config: 6 new keys (HealthBar, OffscreenArrows, ArrowRadius, ArrowSize, ThreatHUD, ThreatLine),
+              old v10.x / v11.x configs load unchanged (missing keys fall back to defaults)
+
+    NOTE ABOUT THE SECURITY TAB: it audits THIS SCRIPT only (integrity, limits, health). It cannot see or
+    predict server-side detection of any game, so it is an estimate and never a guarantee.
+
+    HOW TO EXTEND
+    - New setting      : DefaultConfig + one schema line (Bool / Num / Col / Key) + UI:AddToggle / UI:AddSlider
+    - New tab          : add { Id, Name, Controls = {} } to UI.Tabs + a UI:Build<Name>Tab() call in BuildSpecs
+    - New feature      : add it to FeatureRegistry (Passive = true only if it never writes to the game)
+    - New security check: Security:Register({ Id, Name, Group = "SEC"|"REL", Weight, Critical, Eval })
+    - New control type : add a handler table to Controls (Create / Layout / Refresh / MouseDown)
+
+    Architecture Highlights:
+    - Zero-Allocation Render Loop: Integer-indexed rig arrays & state-shadowed Drawing properties
+    - Reactive Streaming-Safe Rig Tracker: Instant event-driven part binding without polling timeouts
+    - Staggered Dual-Point Wall-Check with a per-frame ray budget
+    - Dirty-Flagged Pixel Crosshair: Zero per-frame bridge writes unless viewport or config changes
+    - Modular Pixel UI: 5 tabs (VISUALS / COMBAT / COLORS / SECURITY / SETTINGS), RightShift toggles menu
+    - Schema-driven config: validated, versioned, 3 profile slots, backup fallback, debounced auto-save
+    - Complete Teardown: Leak-free cleanup on Delete or re-execution
+]]
+
+--==============================================================================
+-- 0. Environment Guard
+--==============================================================================
+if not Drawing or not Drawing.new then
+    warn("[0x] Drawing API is not available in this executor.")
+    return nil
+end
+
+--==============================================================================
+-- 1. Lifecycle Guard (Clean up previous instance on re-execution)
+--==============================================================================
+local GlobalEnv = (type(getgenv) == "function" and getgenv()) or _G
+-- NOTE: Unload first, banner cleanup last (otherwise the old goodbye banner leaks)
+if type(GlobalEnv.__0x_Unload) == "function" then
+    pcall(GlobalEnv.__0x_Unload)
+end
+if type(GlobalEnv.__EnemyESP_Unload) == "function" then
+    pcall(GlobalEnv.__EnemyESP_Unload)
+end
+if type(GlobalEnv.__0x_CleanupBanner) == "function" then
+    pcall(GlobalEnv.__0x_CleanupBanner)
+end
+
+--==============================================================================
+-- 2. Services & Environment
+--==============================================================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+    LocalPlayer = Players.LocalPlayer
+end
+
+local writefile = type(writefile) == "function" and writefile or nil
+local readfile = type(readfile) == "function" and readfile or nil
+local isfile = type(isfile) == "function" and isfile or nil
+
+--==============================================================================
+-- 3. Configuration & Defaults
+--==============================================================================
+local VERSION = "11.5"
+local BUILD = "051126a"
+local OWNER_LABEL = "OWNER" -- text of the header badge (max 10 chars, change freely)
+
+local DefaultConfig = {
+    -- Distance Settings
+    MaxDistance = 500,
+    MinDistanceLimit = 100,
+    MaxDistanceLimit = 2000,
+    DistanceStep = 10,
+
+    -- Colors (RGB) + Alpha (0 = invisible, 1 = opaque)
+    ColorHidden = Color3.fromRGB(255, 255, 255),
+    ColorVisible = Color3.fromRGB(0, 255, 0),
+    ColorCrosshair = Color3.fromRGB(0, 255, 140),
+    ColorDot = Color3.fromRGB(0, 255, 140),
+    ColorHiddenAlpha = 1,
+    ColorVisibleAlpha = 1,
+    ColorCrosshairAlpha = 1,
+    ColorDotAlpha = 1,
+
+    -- ESP Styling
+    BoxThickness = 1,
+    SkeletonThickness = 1,
+    HeadThickness = 1,
+    HeadPadding = 1.15,
+    TextSize = 13,
+
+    -- Toggles & Crosshair Settings
+    ShowDistance = true,
+    ShowSkeleton = true,
+    ShowBox = true,
+    CornerBox = false,
+    ShowHead = true,
+    VisibilityCheck = true,
+    ShowCrosshair = true,
+    CrosshairDot = true,      -- independent from ShowCrosshair
+    CrosshairDotSize = 2,
+    CrosshairSize = 6,
+    CrosshairGap = 4,
+    ShowStats = false,
+    AutoSave = false,
+    TeamCheck = true,
+
+    -- Combat awareness (passive / read-only, drawing only)
+    HealthBar = true,
+    OffscreenArrows = true,
+    ArrowRadius = 180,
+    ArrowSize = 10,
+    ThreatHUD = true,
+    ThreatLine = false,
+
+    -- Raycast Tuning
+    WallPenetrationLimit = 4,
+    RaycastInterval = 0.033,
+    MaxRaysPerFrame = 24,
+
+    -- Keybinds
+    UnloadKey = Enum.KeyCode.Delete,
+    MenuToggleKey = Enum.KeyCode.RightShift,
+}
+
+local Config = {}
+for k, v in pairs(DefaultConfig) do
+    Config[k] = v
+end
+
+-- Keys that can never be bound (movement / system keys -> accidental unload protection)
+local RESERVED_KEYS = {
+    Unknown = true, W = true, A = true, S = true, D = true, Space = true,
+    Escape = true, Return = true, Tab = true, Slash = true, Backquote = true,
+}
+
+-- Every user-facing feature. Passive = true means: it ONLY reads game state and draws on screen
+-- (no remotes, no input injection, no writes to game instances). The Security tab audits this list.
+local FeatureRegistry = {
+    { Key = "ShowBox",         Name = "2D BOX",       Passive = true },
+    { Key = "CornerBox",       Name = "CORNER BOX",   Passive = true },
+    { Key = "ShowSkeleton",    Name = "SKELETON",     Passive = true },
+    { Key = "ShowHead",        Name = "HEAD CIRCLE",  Passive = true },
+    { Key = "ShowDistance",    Name = "DISTANCE",     Passive = true },
+    { Key = "VisibilityCheck", Name = "WALL CHECK",   Passive = true }, -- read-only raycasts
+    { Key = "ShowCrosshair",   Name = "CROSSHAIR",    Passive = true },
+    { Key = "CrosshairDot",    Name = "XHAIR DOT",    Passive = true },
+    { Key = "HealthBar",       Name = "HEALTH BAR",   Passive = true },
+    { Key = "OffscreenArrows", Name = "ARROWS",       Passive = true },
+    { Key = "ThreatHUD",       Name = "THREAT HUD",   Passive = true },
+    { Key = "ThreatLine",      Name = "THREAT LINE",  Passive = true },
+    { Key = "ShowStats",       Name = "DEBUG",        Passive = true },
+}
+
+--==============================================================================
+-- 4. Integer-Indexed Rig Constants (Zero String-Hash Lookups in Render Loop)
+--==============================================================================
+local OFFSCREEN_MARGIN = 250
+local HEAD_NUM_SIDES = 24
+local CORNER_FRACTION = 0.25
+local DRAWINGS_PER_PLAYER = 29 -- 1 Box + 1 Head + 1 Text + 14 Skeleton + 8 Corner + 2 Health + 2 Arrow
+
+-- R15 Part Indexing (1..15)
+local R15_PART_NAMES = {
+    [1]  = "Head",
+    [2]  = "UpperTorso",
+    [3]  = "LowerTorso",
+    [4]  = "LeftUpperArm",
+    [5]  = "LeftLowerArm",
+    [6]  = "LeftHand",
+    [7]  = "RightUpperArm",
+    [8]  = "RightLowerArm",
+    [9]  = "RightHand",
+    [10] = "LeftUpperLeg",
+    [11] = "LeftLowerLeg",
+    [12] = "LeftFoot",
+    [13] = "RightUpperLeg",
+    [14] = "RightLowerLeg",
+    [15] = "RightFoot",
+}
+
+local R15_NAME_TO_INDEX = {}
+for idx, name in ipairs(R15_PART_NAMES) do
+    R15_NAME_TO_INDEX[name] = idx
+end
+
+local R15_BONES = {
+    { 1, 2 },   -- Head -> UpperTorso
+    { 2, 3 },   -- UpperTorso -> LowerTorso
+    { 2, 4 },   -- UpperTorso -> LeftUpperArm
+    { 4, 5 },   -- LeftUpperArm -> LeftLowerArm
+    { 5, 6 },   -- LeftLowerArm -> LeftHand
+    { 2, 7 },   -- UpperTorso -> RightUpperArm
+    { 7, 8 },   -- RightUpperArm -> RightLowerArm
+    { 8, 9 },   -- RightLowerArm -> RightHand
+    { 3, 10 },  -- LowerTorso -> LeftUpperLeg
+    { 10, 11 }, -- LeftUpperLeg -> LeftLowerLeg
+    { 11, 12 }, -- LeftLowerLeg -> LeftFoot
+    { 3, 13 },  -- LowerTorso -> RightUpperLeg
+    { 13, 14 }, -- RightUpperLeg -> RightLowerLeg
+    { 14, 15 }, -- RightLowerLeg -> RightFoot
+}
+
+local R15_LOWEST_INDICES = { 12, 15, 11, 14, 3 }
+
+-- R6 Part Indexing (1..6)
+local R6_PART_NAMES = {
+    [1] = "Head",
+    [2] = "Torso",
+    [3] = "Left Arm",
+    [4] = "Right Arm",
+    [5] = "Left Leg",
+    [6] = "Right Leg",
+}
+
+local R6_NAME_TO_INDEX = {}
+for idx, name in ipairs(R6_PART_NAMES) do
+    R6_NAME_TO_INDEX[name] = idx
+end
+
+local R6_BONES = {
+    { 1, 2 }, -- Head -> Torso
+    { 2, 3 }, -- Torso -> Left Arm
+    { 2, 4 }, -- Torso -> Right Arm
+    { 2, 5 }, -- Torso -> Left Leg
+    { 2, 6 }, -- Torso -> Right Leg
+}
+
+local R6_LOWEST_INDICES = { 5, 6, 2 }
+
+--==============================================================================
+-- 5. Internal State & World Tracker
+--==============================================================================
+local ESPCache = {}
+local GlobalConnections = {}
+local ActiveBanner = nil
+local IsUnloaded = false
+local PlayerSeedCounter = 0
+local StyleVersion = 1 -- bumped whenever drawing style (thickness / size) must be re-applied
+
+local FALLBACK_VIEWPORT = Vector2.new(1920, 1080)
+
+-- Roblox reports a 1x1 viewport for a moment at startup; never trust it
+local function SanitizeViewport(v)
+    if typeof(v) ~= "Vector2" or v.X < 2 or v.Y < 2 then
+        return FALLBACK_VIEWPORT
+    end
+    return v
+end
+
+local WorldState = {
+    Camera = Workspace.CurrentCamera,
+    ViewportSize = Workspace.CurrentCamera and SanitizeViewport(Workspace.CurrentCamera.ViewportSize) or FALLBACK_VIEWPORT,
+    CameraConn = nil,
+    LocalChar = nil,
+    LocalRoot = nil,
+    LocalCharConns = {},
+}
+
+local Metrics = {
+    FrameCount = 0,
+    RayCount = 0,
+    FrameRays = 0,
+    LastSampleTime = os.clock(),
+    FPS = 0,
+    FrameTimeMs = 0,
+    ESPAvgMs = 0,
+    ESPMaxMs = 0,
+    ESPSumMs = 0,
+    ESPMaxSample = 0,
+    RaysPerSec = 0,
+    TrackedPlayers = 0,
+    ActiveESPCount = 0,
+}
+
+-- Runtime health counters (read by the Security tab)
+local Health = {
+    Token = {},            -- unique identity of THIS instance
+    Unload = nil,          -- set once Unload exists
+    ConfigProxy = nil,     -- set once the public API exists
+    LoopErrorsTotal = 0,
+    LoopPauses = 0,
+    PausedUntil = 0,
+    AllocFailures = 0,
+    LastSaveOk = nil,      -- nil = never tried
+    LastLoadOk = nil,
+}
+
+-- Forward Declarations
+local UI
+local Stats
+local Crosshair
+local Combat
+local Security
+
+--==============================================================================
+-- 6. Utility Functions
+--==============================================================================
+local function SafeDisconnect(conn)
+    if conn and conn.Connected then
+        conn:Disconnect()
+    end
+end
+
+local function SafeRemoveDrawing(drawing)
+    if drawing then
+        pcall(drawing.Remove, drawing)
+    end
+end
+
+local function SnapStep(val, minVal, maxVal, step)
+    local clamped = math.clamp(val, minVal, maxVal)
+    if not step or step <= 0 then
+        return clamped
+    end
+    local snapped = minVal + math.floor(((clamped - minVal) / step) + 0.5) * step
+    snapped = math.floor(snapped * 1e6 + 0.5) / 1e6 -- kill float drift (0.55000001)
+    return math.clamp(snapped, minVal, maxVal)
+end
+
+local function To255(x)
+    return math.clamp(math.floor(x * 255 + 0.5), 0, 255)
+end
+
+local function ColorToRGBTable(col)
+    return { r = To255(col.R), g = To255(col.G), b = To255(col.B) }
+end
+
+local function Resolve(state, current)
+    if state == nil then
+        return not current
+    end
+    return state == true
+end
+
+local KEY_SHORT = {
+    RightShift = "RSHIFT", LeftShift = "LSHIFT", RightControl = "RCTRL", LeftControl = "LCTRL",
+    RightAlt = "RALT", LeftAlt = "LALT", Delete = "DEL", Insert = "INS", Backspace = "BKSP",
+    PageUp = "PGUP", PageDown = "PGDN",
+}
+local function KeyLabel(keyCode)
+    local n = keyCode.Name
+    return string.upper(KEY_SHORT[n] or n)
+end
+
+local CachedFont = (Drawing.Fonts and Drawing.Fonts.Monospace) or 3
+local function GetFont()
+    return CachedFont
+end
+
+local function BumpStyle()
+    StyleVersion += 1
+end
+
+-- Wraps an event handler: an error inside can never break the connection chain,
+-- and warnings are rate-limited (max one per tag every 5 seconds).
+local GuardWarnAt = {}
+local function Guard(tag, fn)
+    return function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok then
+            local now = os.clock()
+            if (GuardWarnAt[tag] or -10) + 5 < now then
+                GuardWarnAt[tag] = now
+                warn(string.format("[0x] %s error: %s", tag, tostring(err)))
+            end
+        end
+    end
+end
+
+local function PointInRect(px, py, rx, ry, rw, rh)
+    return px >= rx and px <= (rx + rw) and py >= ry and py <= (ry + rh)
+end
+
+-- Total number of Drawing objects owned by this script (used by Stats + Security)
+local function GetDrawingTotal()
+    local total = Metrics.TrackedPlayers * DRAWINGS_PER_PLAYER
+    if UI then total += #UI.Objects end
+    if Crosshair then total += #Crosshair.Objects end
+    if Combat then total += #Combat.Objects end
+    if Stats then total += #Stats.Objects end
+    return total
+end
+
+--==============================================================================
+-- 7. LocalPlayer & Camera State Tracker (Zero Per-Frame FindFirstChild)
+--==============================================================================
+local function BindLocalCharacter(char)
+    for _, conn in pairs(WorldState.LocalCharConns) do
+        SafeDisconnect(conn)
+    end
+    table.clear(WorldState.LocalCharConns)
+
+    WorldState.LocalChar = char
+    WorldState.LocalRoot = nil
+    if not char then return end
+
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if root and root:IsA("BasePart") then
+        WorldState.LocalRoot = root
+    end
+
+    WorldState.LocalCharConns.ChildAdded = char.ChildAdded:Connect(function(child)
+        if child.Name == "HumanoidRootPart" and child:IsA("BasePart") then
+            WorldState.LocalRoot = child
+        end
+    end)
+
+    WorldState.LocalCharConns.ChildRemoved = char.ChildRemoved:Connect(function(child)
+        if child == WorldState.LocalRoot then
+            WorldState.LocalRoot = nil
+        end
+    end)
+end
+
+local function BindCamera(cam)
+    SafeDisconnect(WorldState.CameraConn)
+    WorldState.CameraConn = nil
+    WorldState.Camera = cam
+    if not cam then return end
+
+    WorldState.ViewportSize = SanitizeViewport(cam.ViewportSize)
+    WorldState.CameraConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+        WorldState.ViewportSize = SanitizeViewport(cam.ViewportSize)
+        if Crosshair then
+            Crosshair:MarkDirty()
+        end
+        if UI then
+            UI:ClampToViewport()
+        end
+    end)
+
+    if Crosshair then
+        Crosshair:MarkDirty()
+    end
+end
+
+--==============================================================================
+-- 8. Config Persistence (Schema-Driven, Versioned, Profile Slots, Backup)
+--==============================================================================
+local ConfigIO = {
+    BaseName = "0x_config",   -- slot 1 => 0x_config.json (backward compatible)
+    SlotMetaFile = "0x_slot.txt",
+    FormatVersion = 2,
+    MaxFileSize = 32768,
+    MaxSlots = 3,
+    Slot = 1,
+    AutoSaveToken = 0,
+    Rules = {},
+}
+
+-- Ordered schema (drives Save / Load / Validate / Audit / Ox.Set)
+local ConfigSchema = {}
+local function AddRule(rule)
+    table.insert(ConfigSchema, rule)
+    ConfigIO.Rules[rule.key] = rule
+end
+local function Bool(key) AddRule({ key = key, type = "boolean" }) end
+local function Num(key, min, max, step) AddRule({ key = key, type = "number", min = min, max = max, step = step }) end
+local function Col(key) AddRule({ key = key, type = "color" }) end
+local function Key(key) AddRule({ key = key, type = "keycode" }) end
+
+Bool("ShowBox"); Bool("CornerBox"); Bool("ShowSkeleton"); Bool("ShowHead"); Bool("ShowDistance")
+Bool("VisibilityCheck"); Bool("ShowCrosshair"); Bool("CrosshairDot"); Bool("TeamCheck")
+Bool("ShowStats"); Bool("AutoSave")
+Bool("HealthBar"); Bool("OffscreenArrows"); Bool("ThreatHUD"); Bool("ThreatLine")
+Num("CrosshairSize", 2, 20, 1)
+Num("CrosshairGap", 0, 16, 1)
+Num("CrosshairDotSize", 1, 8, 1)
+Num("ArrowRadius", 60, 400, 5)
+Num("ArrowSize", 6, 24, 1)
+Num("MaxDistance", DefaultConfig.MinDistanceLimit, DefaultConfig.MaxDistanceLimit, DefaultConfig.DistanceStep)
+Num("ColorHiddenAlpha", 0, 1, 0.01)
+Num("ColorVisibleAlpha", 0, 1, 0.01)
+Num("ColorCrosshairAlpha", 0, 1, 0.01)
+Num("ColorDotAlpha", 0, 1, 0.01)
+Num("BoxThickness", 1, 5, 1)
+Num("SkeletonThickness", 1, 5, 1)
+Num("HeadThickness", 1, 5, 1)
+Num("HeadPadding", 1, 2, 0.01)
+Num("TextSize", 10, 24, 1)
+Num("WallPenetrationLimit", 1, 8, 1)
+Num("RaycastInterval", 0.01, 0.25, 0.001)
+Num("MaxRaysPerFrame", 4, 64, 1)
+Col("ColorHidden"); Col("ColorVisible"); Col("ColorCrosshair"); Col("ColorDot")
+Key("UnloadKey"); Key("MenuToggleKey")
+
+function ConfigIO.IsSupported()
+    return writefile ~= nil and readfile ~= nil and isfile ~= nil
+end
+
+function ConfigIO.FileFor(slot)
+    if slot == 1 then
+        return ConfigIO.BaseName .. ".json"
+    end
+    return string.format("%s_%d.json", ConfigIO.BaseName, slot)
+end
+
+function ConfigIO.ValidateColorTable(tbl)
+    if type(tbl) ~= "table" then return nil end
+    local r, g, b = tonumber(tbl.r), tonumber(tbl.g), tonumber(tbl.b)
+    if not r or not g or not b then return nil end
+    if r ~= r or g ~= g or b ~= b then return nil end
+    if math.abs(r) == math.huge or math.abs(g) == math.huge or math.abs(b) == math.huge then return nil end
+    return Color3.fromRGB(
+        math.clamp(math.floor(r + 0.5), 0, 255),
+        math.clamp(math.floor(g + 0.5), 0, 255),
+        math.clamp(math.floor(b + 0.5), 0, 255)
+    )
+end
+
+local function IsBindableKey(kc)
+    return typeof(kc) == "EnumItem" and kc.EnumType == Enum.KeyCode and not RESERVED_KEYS[kc.Name]
+end
+
+-- Returns a validated value or nil
+function ConfigIO.ParseValue(rule, raw)
+    local t = rule.type
+    if t == "boolean" then
+        if type(raw) == "boolean" then return raw end
+    elseif t == "number" then
+        local n = tonumber(raw)
+        if n and n == n and math.abs(n) ~= math.huge then
+            return SnapStep(n, rule.min, rule.max, rule.step)
+        end
+    elseif t == "color" then
+        if typeof(raw) == "Color3" then return raw end
+        return ConfigIO.ValidateColorTable(raw)
+    elseif t == "keycode" then
+        if typeof(raw) == "EnumItem" then
+            if IsBindableKey(raw) then
+                return raw
+            end
+            return nil
+        end
+        if type(raw) == "string" and #raw <= 32 then
+            local ok, kc = pcall(function() return Enum.KeyCode[raw] end)
+            if ok and IsBindableKey(kc) then
+                return kc
+            end
+        end
+    end
+    return nil
+end
+
+-- Integrity audit of the LIVE config against the schema. Returns (badCount, totalCount).
+function ConfigIO.Audit()
+    local bad, total = 0, 0
+    for _, rule in ipairs(ConfigSchema) do
+        total += 1
+        local cur = Config[rule.key]
+        if rule.type == "number" then
+            if type(cur) ~= "number" then
+                bad += 1
+            else
+                local parsed = ConfigIO.ParseValue(rule, cur)
+                if parsed == nil or math.abs(parsed - cur) > 1e-4 then
+                    bad += 1
+                end
+            end
+        else
+            if ConfigIO.ParseValue(rule, cur) == nil then
+                bad += 1
+            end
+        end
+    end
+    return bad, total
+end
+
+function ConfigIO.Serialize(rule, value)
+    if rule.type == "color" then
+        return ColorToRGBTable(value)
+    elseif rule.type == "keycode" then
+        return value.Name
+    end
+    return value
+end
+
+local function AfterConfigChange()
+    BumpStyle()
+    if UI then
+        UI:UpdateFooter()
+        UI:Refresh()
+    end
+    if Stats then Stats:SetVisible(Config.ShowStats) end
+    if Crosshair then Crosshair:MarkDirty() end
+end
+
+local function SafeRead(name)
+    if not ConfigIO.IsSupported() then return nil, "NO FILE API" end
+    local okEx, exists = pcall(isfile, name)
+    if not okEx or not exists then return nil, "MISSING" end
+    local okRead, raw = pcall(readfile, name)
+    if not okRead or type(raw) ~= "string" then return nil, "READ ERR" end
+    return raw
+end
+
+function ConfigIO.Decode(raw)
+    if type(raw) ~= "string" or #raw == 0 or #raw > ConfigIO.MaxFileSize then
+        return nil, "CORRUPT FILE"
+    end
+    local ok, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not ok or type(decoded) ~= "table" then
+        return nil, "CORRUPT FILE"
+    end
+    if decoded.version ~= nil then
+        if type(decoded.version) ~= "number" or decoded.version > ConfigIO.FormatVersion then
+            return nil, "NEWER FORMAT"
+        end
+    end
+    return decoded
+end
+
+-- Builds a full validated config snapshot. Missing/invalid keys fall back to defaults.
+function ConfigIO.Stage(decoded)
+    local settingsTbl = type(decoded.settings) == "table" and decoded.settings or decoded
+    local staged, applied, skipped = {}, 0, 0
+
+    for _, rule in ipairs(ConfigSchema) do
+        local key = rule.key
+        local rawVal = settingsTbl[key]
+        local value = nil
+        if rawVal ~= nil then
+            value = ConfigIO.ParseValue(rule, rawVal)
+            if value ~= nil then
+                applied += 1
+            else
+                skipped += 1
+            end
+        end
+        if value == nil then
+            value = DefaultConfig[key]
+        end
+        staged[key] = value
+    end
+
+    -- Migration (v10.x -> v11.x): the dot did not have its own color, inherit the crosshair look
+    if settingsTbl.ColorDot == nil then
+        staged.ColorDot = staged.ColorCrosshair
+    end
+    if settingsTbl.ColorDotAlpha == nil then
+        staged.ColorDotAlpha = staged.ColorCrosshairAlpha
+    end
+
+    if staged.UnloadKey == staged.MenuToggleKey then
+        staged.UnloadKey = DefaultConfig.UnloadKey
+        staged.MenuToggleKey = DefaultConfig.MenuToggleKey
+    end
+
+    return staged, applied, skipped
+end
+
+function ConfigIO.SaveSlotMeta()
+    if not ConfigIO.IsSupported() then return end
+    pcall(writefile, ConfigIO.SlotMetaFile, tostring(ConfigIO.Slot))
+end
+
+function ConfigIO.LoadSlotMeta()
+    local raw = SafeRead(ConfigIO.SlotMetaFile)
+    if raw then
+        local n = tonumber(string.match(raw, "%d+"))
+        if n then
+            n = math.floor(n)
+            if n >= 1 and n <= ConfigIO.MaxSlots then
+                ConfigIO.Slot = n
+            end
+        end
+    end
+end
+
+function ConfigIO.Save()
+    if not ConfigIO.IsSupported() then
+        return false, "NO FILE API"
+    end
+
+    local settings = {}
+    for _, rule in ipairs(ConfigSchema) do
+        settings[rule.key] = ConfigIO.Serialize(rule, Config[rule.key])
+    end
+
+    local payload = {
+        version = ConfigIO.FormatVersion,
+        script = VERSION,
+        build = BUILD,
+        menu = (UI and UI.Ready) and {
+            x = math.floor(UI.Position.X),
+            y = math.floor(UI.Position.Y),
+        } or nil,
+        settings = settings,
+    }
+
+    local okEncode, encoded = pcall(HttpService.JSONEncode, HttpService, payload)
+    if not okEncode or type(encoded) ~= "string" then
+        Health.LastSaveOk = false
+        return false, "ENCODE ERR"
+    end
+
+    local fileName = ConfigIO.FileFor(ConfigIO.Slot)
+
+    -- Keep the last known-good file as a backup before overwriting
+    local oldRaw = SafeRead(fileName)
+    if oldRaw and ConfigIO.Decode(oldRaw) then
+        pcall(writefile, fileName .. ".bak", oldRaw)
+    end
+
+    local okWrite = pcall(writefile, fileName, encoded)
+    if not okWrite then
+        Health.LastSaveOk = false
+        return false, "WRITE ERR"
+    end
+
+    Health.LastSaveOk = true
+    return true, string.format("SAVED #%d", ConfigIO.Slot)
+end
+
+function ConfigIO.Load(isInitialStartup)
+    if not ConfigIO.IsSupported() then
+        return false, "NO FILE API"
+    end
+
+    local fileName = ConfigIO.FileFor(ConfigIO.Slot)
+    local raw, readErr = SafeRead(fileName)
+    local decoded, decodeErr = nil, readErr
+    local usedBackup = false
+
+    if raw then
+        decoded, decodeErr = ConfigIO.Decode(raw)
+    end
+
+    if not decoded then
+        local bakRaw = SafeRead(fileName .. ".bak")
+        if bakRaw then
+            decoded = ConfigIO.Decode(bakRaw)
+            usedBackup = decoded ~= nil
+        end
+    end
+
+    if not decoded then
+        if decodeErr == "MISSING" then
+            return false, "NO SAVE FILE"
+        end
+        Health.LastLoadOk = false
+        return false, decodeErr or "CORRUPT FILE"
+    end
+
+    local staged, appliedCount, skippedCount = ConfigIO.Stage(decoded)
+    if appliedCount == 0 then
+        Health.LastLoadOk = false
+        return false, "CORRUPT FILE"
+    end
+
+    for k, v in pairs(staged) do
+        Config[k] = v
+    end
+    Health.LastLoadOk = true
+
+    if isInitialStartup and UI and UI.Ready and type(decoded.menu) == "table" then
+        local mx = tonumber(decoded.menu.x)
+        local my = tonumber(decoded.menu.y)
+        if mx and my and mx == mx and my == my and math.abs(mx) ~= math.huge and math.abs(my) ~= math.huge then
+            local viewport = WorldState.ViewportSize
+            local clampedX = math.clamp(math.floor(mx), 0, math.max(0, viewport.X - UI.Width))
+            local clampedY = math.clamp(math.floor(my), 0, math.max(0, viewport.Y - UI.Height))
+            UI.Position = Vector2.new(clampedX, clampedY)
+            UI:UpdateLayout()
+        end
+    end
+
+    AfterConfigChange()
+
+    if usedBackup then
+        return true, string.format("LOADED #%d (BAK)", ConfigIO.Slot)
+    end
+    if skippedCount > 0 then
+        return true, string.format("LOADED #%d (%d SKIP)", ConfigIO.Slot, skippedCount)
+    end
+    return true, string.format("LOADED #%d", ConfigIO.Slot)
+end
+
+function ConfigIO.Reset()
+    for k, v in pairs(DefaultConfig) do
+        Config[k] = v
+    end
+    AfterConfigChange()
+    return true, "DEFAULTS RESTORED"
+end
+
+function ConfigIO.SetSlot(n)
+    n = math.floor(tonumber(n) or 0)
+    if n < 1 or n > ConfigIO.MaxSlots then
+        return false, "BAD SLOT"
+    end
+    ConfigIO.Slot = n
+    ConfigIO.SaveSlotMeta()
+    local ok, msg = ConfigIO.Load(false)
+    if not ok and msg == "NO SAVE FILE" then
+        return true, string.format("SLOT %d EMPTY", n)
+    end
+    return ok, msg
+end
+
+-- Validated setter used by the public API
+function ConfigIO.Set(key, value)
+    local rule = ConfigIO.Rules[key]
+    if not rule then return false, "UNKNOWN KEY" end
+    local parsed = ConfigIO.ParseValue(rule, value)
+    if parsed == nil then return false, "INVALID VALUE" end
+    if rule.type == "keycode" then
+        local other = (key == "UnloadKey") and Config.MenuToggleKey or Config.UnloadKey
+        if parsed == other then return false, "KEY IN USE" end
+    end
+    Config[key] = parsed
+    AfterConfigChange()
+    ConfigIO.NotifyChanged()
+    return true, "OK"
+end
+
+-- Debounced auto-save (fires 1.5s after the last change)
+function ConfigIO.NotifyChanged()
+    if IsUnloaded or not Config.AutoSave or not ConfigIO.IsSupported() then return end
+    ConfigIO.AutoSaveToken += 1
+    local token = ConfigIO.AutoSaveToken
+    task.delay(1.5, function()
+        if IsUnloaded or token ~= ConfigIO.AutoSaveToken or not Config.AutoSave then return end
+        local ok = ConfigIO.Save()
+        if ok and UI and UI.Ready then
+            UI:SetStatus("AUTO-SAVED")
+        end
+    end)
+end
+
+--==============================================================================
+-- 9. Welcome & Goodbye Banner (With Global Cleanup Hook)
+--==============================================================================
+local function CleanupActiveBanner()
+    if ActiveBanner then
+        for _, obj in ipairs(ActiveBanner) do
+            SafeRemoveDrawing(obj)
+        end
+        ActiveBanner = nil
+    end
+end
+GlobalEnv.__0x_CleanupBanner = CleanupActiveBanner
+
+local function ShowBanner(message, accentColor, duration)
+    CleanupActiveBanner()
+
+    local created = {}
+    local ok = pcall(function()
+        local viewport = WorldState.ViewportSize
+        local width = 360
+        local height = 34
+        local x = math.max(0, math.floor((viewport.X - width) * 0.5))
+        local y = 18
+
+        local function Make(className, props)
+            local obj = Drawing.new(className)
+            table.insert(created, obj) -- tracked immediately so a mid-way failure never leaks
+            for k, v in pairs(props) do
+                obj[k] = v
+            end
+            return obj
+        end
+
+        Make("Square", {
+            Size = Vector2.new(width + 4, height + 4),
+            Position = Vector2.new(x - 2, y - 2),
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true, ZIndex = 10, Visible = true,
+        })
+        Make("Square", {
+            Size = Vector2.new(width, height),
+            Position = Vector2.new(x, y),
+            Color = Color3.fromRGB(35, 35, 35),
+            Filled = true, ZIndex = 11, Visible = true,
+        })
+        Make("Square", {
+            Size = Vector2.new(width, 2),
+            Position = Vector2.new(x, y),
+            Color = accentColor,
+            Filled = true, ZIndex = 12, Visible = true,
+        })
+        Make("Text", {
+            Text = message,
+            Size = 14,
+            Font = GetFont(),
+            Center = true,
+            Outline = true,
+            Color = Color3.fromRGB(255, 255, 255),
+            Position = Vector2.new(x + math.floor(width * 0.5), y + 9),
+            ZIndex = 13, Visible = true,
+        })
+    end)
+
+    if ok then
+        ActiveBanner = created
+        task.delay(duration or 3, function()
+            if ActiveBanner == created then
+                CleanupActiveBanner()
+            end
+        end)
+    else
+        for _, obj in ipairs(created) do
+            SafeRemoveDrawing(obj)
+        end
+    end
+end
+
+--==============================================================================
+-- 10. Dirty-Flagged Pixel Crosshair (Lines + Fully Independent Dot)
+--==============================================================================
+Crosshair = {
+    Objects = {},
+    LinesOutline = {},
+    LinesInner = {},
+    DotOutline = nil,
+    DotInner = nil,
+    LinesShown = false,
+    DotShown = false,
+    Dirty = true,
+    Ready = false,
+}
+
+function Crosshair:NewDrawing(className, props)
+    local obj = Drawing.new(className)
+    table.insert(self.Objects, obj)
+    for k, v in pairs(props) do
+        obj[k] = v
+    end
+    return obj
+end
+
+function Crosshair:MarkDirty()
+    self.Dirty = true
+    self:Flush()
+end
+
+function Crosshair:Init()
+    local ok, err = pcall(function()
+        for i = 1, 4 do
+            self.LinesOutline[i] = self:NewDrawing("Line", {
+                Thickness = 3,
+                Color = Color3.fromRGB(0, 0, 0),
+                Transparency = 1,
+                ZIndex = 8,
+                Visible = false,
+            })
+            self.LinesInner[i] = self:NewDrawing("Line", {
+                Thickness = 1,
+                Color = Config.ColorCrosshair,
+                Transparency = 1,
+                ZIndex = 9,
+                Visible = false,
+            })
+        end
+
+        self.DotOutline = self:NewDrawing("Square", {
+            Size = Vector2.new(4, 4),
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true,
+            Transparency = 1,
+            ZIndex = 8,
+            Visible = false,
+        })
+
+        self.DotInner = self:NewDrawing("Square", {
+            Size = Vector2.new(2, 2),
+            Color = Config.ColorDot,
+            Filled = true,
+            Transparency = 1,
+            ZIndex = 9,
+            Visible = false,
+        })
+    end)
+
+    if ok then
+        self.Ready = true
+        self:MarkDirty()
+    else
+        warn("[0x] Crosshair failed to initialize: " .. tostring(err))
+    end
+end
+
+function Crosshair:HideLines()
+    if not self.LinesShown then return end
+    self.LinesShown = false
+    for i = 1, 4 do
+        self.LinesOutline[i].Visible = false
+        self.LinesInner[i].Visible = false
+    end
+end
+
+function Crosshair:HideDot()
+    if not self.DotShown then return end
+    self.DotShown = false
+    self.DotOutline.Visible = false
+    self.DotInner.Visible = false
+end
+
+function Crosshair:Hide()
+    if not self.Ready then return end
+    self:HideLines()
+    self:HideDot()
+end
+
+function Crosshair:Flush()
+    if not self.Dirty or IsUnloaded or not self.Ready then
+        return
+    end
+    self.Dirty = false
+
+    local viewport = WorldState.ViewportSize
+    local cx = math.floor(viewport.X * 0.5)
+    local cy = math.floor(viewport.Y * 0.5)
+
+    --------------------------------------------------------------------------
+    -- Lines (controlled ONLY by ShowCrosshair / size / gap / ColorCrosshair)
+    --------------------------------------------------------------------------
+    local size = math.floor(Config.CrosshairSize)
+    local gap = math.floor(Config.CrosshairGap)
+
+    if Config.ShowCrosshair and size > 0 then
+        local col = Config.ColorCrosshair
+        local alpha = Config.ColorCrosshairAlpha
+        local lo, li = self.LinesOutline, self.LinesInner
+
+        -- Top
+        lo[1].From = Vector2.new(cx, cy - gap + 1)
+        lo[1].To   = Vector2.new(cx, cy - gap - size - 1)
+        li[1].From = Vector2.new(cx, cy - gap)
+        li[1].To   = Vector2.new(cx, cy - gap - size)
+
+        -- Bottom
+        lo[2].From = Vector2.new(cx, cy + gap - 1)
+        lo[2].To   = Vector2.new(cx, cy + gap + size + 1)
+        li[2].From = Vector2.new(cx, cy + gap)
+        li[2].To   = Vector2.new(cx, cy + gap + size)
+
+        -- Left
+        lo[3].From = Vector2.new(cx - gap + 1, cy)
+        lo[3].To   = Vector2.new(cx - gap - size - 1, cy)
+        li[3].From = Vector2.new(cx - gap, cy)
+        li[3].To   = Vector2.new(cx - gap - size, cy)
+
+        -- Right
+        lo[4].From = Vector2.new(cx + gap - 1, cy)
+        lo[4].To   = Vector2.new(cx + gap + size + 1, cy)
+        li[4].From = Vector2.new(cx + gap, cy)
+        li[4].To   = Vector2.new(cx + gap + size, cy)
+
+        local reveal = not self.LinesShown
+        for i = 1, 4 do
+            li[i].Color = col
+            li[i].Transparency = alpha
+            lo[i].Transparency = alpha
+            if reveal then
+                lo[i].Visible = true
+                li[i].Visible = true
+            end
+        end
+        self.LinesShown = true
+    else
+        self:HideLines()
+    end
+
+    --------------------------------------------------------------------------
+    -- Dot (controlled ONLY by CrosshairDot / dot size / ColorDot / ColorDotAlpha)
+    --------------------------------------------------------------------------
+    if Config.CrosshairDot then
+        local d = math.clamp(math.floor(Config.CrosshairDotSize), 1, 8)
+        local half = math.floor(d / 2)
+        local ix, iy = cx - half, cy - half
+        local dotAlpha = Config.ColorDotAlpha
+
+        self.DotOutline.Size = Vector2.new(d + 2, d + 2)
+        self.DotOutline.Position = Vector2.new(ix - 1, iy - 1)
+        self.DotInner.Size = Vector2.new(d, d)
+        self.DotInner.Position = Vector2.new(ix, iy)
+        self.DotInner.Color = Config.ColorDot
+        self.DotInner.Transparency = dotAlpha
+        self.DotOutline.Transparency = dotAlpha
+        if not self.DotShown then
+            self.DotOutline.Visible = true
+            self.DotInner.Visible = true
+            self.DotShown = true
+        end
+    else
+        self:HideDot()
+    end
+end
+
+function Crosshair:Destroy()
+    self.Ready = false
+    for _, obj in ipairs(self.Objects) do
+        SafeRemoveDrawing(obj)
+    end
+    table.clear(self.Objects)
+    table.clear(self.LinesOutline)
+    table.clear(self.LinesInner)
+    self.DotOutline = nil
+    self.DotInner = nil
+    self.LinesShown = false
+    self.DotShown = false
+end
+
+--==============================================================================
+-- 11. Debug / Performance Stats Overlay
+--==============================================================================
+Stats = {
+    Visible = false,
+    Objects = {},
+    Lines = {},
+    X = 12,
+    Y = 48,
+    Width = 215,
+    Height = 143,
+}
+
+function Stats:NewDrawing(className, props)
+    local obj = Drawing.new(className)
+    table.insert(self.Objects, obj)
+    for k, v in pairs(props) do
+        obj[k] = v
+    end
+    return obj
+end
+
+function Stats:Init()
+    local ok, err = pcall(function()
+        self.Border = self:NewDrawing("Square", {
+            Size = Vector2.new(self.Width + 4, self.Height + 4),
+            Position = Vector2.new(self.X - 2, self.Y - 2),
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true,
+            ZIndex = 5,
+            Visible = false,
+        })
+
+        self.Background = self:NewDrawing("Square", {
+            Size = Vector2.new(self.Width, self.Height),
+            Position = Vector2.new(self.X, self.Y),
+            Color = Color3.fromRGB(35, 35, 35),
+            Filled = true,
+            ZIndex = 6,
+            Visible = false,
+        })
+
+        self.Divider = self:NewDrawing("Line", {
+            From = Vector2.new(self.X, self.Y + 22),
+            To = Vector2.new(self.X + self.Width, self.Y + 22),
+            Color = Color3.fromRGB(0, 0, 0),
+            Thickness = 2,
+            ZIndex = 7,
+            Visible = false,
+        })
+
+        local labels = {
+            string.format("0x DEBUG  v%s (%s)", VERSION, BUILD),
+            "FPS        : --",
+            "FRAME      : -- ms",
+            "ESP AVG/MAX: -- / -- ms",
+            "PLAYERS    : 0 / 0",
+            "RAYS/S     : 0",
+            "DRAWINGS   : 0",
+            "SEC / REL  : -- / --",
+        }
+
+        for i, text in ipairs(labels) do
+            local lineY = (i == 1) and (self.Y + 4) or (self.Y + 12 + (i - 1) * 15)
+            self.Lines[i] = self:NewDrawing("Text", {
+                Text = text,
+                Size = 13,
+                Font = GetFont(),
+                Color = Color3.fromRGB(255, 255, 255),
+                Outline = true,
+                Center = false,
+                Position = Vector2.new(self.X + 8, lineY),
+                ZIndex = 7,
+                Visible = false,
+            })
+        end
+    end)
+
+    if ok then
+        self:SetVisible(Config.ShowStats)
+    else
+        warn("[0x] Stats overlay failed to initialize: " .. tostring(err))
+    end
+end
+
+function Stats:SetVisible(state)
+    local target = state == true
+    if self.Visible == target then return end
+    self.Visible = target
+    for _, obj in ipairs(self.Objects) do
+        obj.Visible = target
+    end
+    if target then
+        self:UpdateText()
+    end
+end
+
+function Stats:UpdateText()
+    if not self.Visible or #self.Lines < 8 then return end
+
+    local fpsColor = Color3.fromRGB(255, 255, 255)
+    if Metrics.FPS < 30 then
+        fpsColor = Color3.fromRGB(255, 80, 80)
+    elseif Metrics.FPS < 55 then
+        fpsColor = Color3.fromRGB(255, 220, 80)
+    end
+
+    self.Lines[2].Color = fpsColor
+    self.Lines[2].Text = string.format("FPS        : %d", Metrics.FPS)
+    self.Lines[3].Text = string.format("FRAME      : %.2f ms", Metrics.FrameTimeMs)
+    self.Lines[4].Text = string.format("ESP AVG/MAX: %.2f / %.2f ms", Metrics.ESPAvgMs, Metrics.ESPMaxMs)
+    self.Lines[5].Text = string.format("PLAYERS    : %d / %d", Metrics.ActiveESPCount, Metrics.TrackedPlayers)
+    self.Lines[6].Text = string.format("RAYS/S     : %d", Metrics.RaysPerSec)
+    self.Lines[7].Text = string.format("DRAWINGS   : %d", GetDrawingTotal())
+    if Security then
+        self.Lines[8].Text = string.format("SEC / REL  : %d%% / %d%%", Security.SecurityPct, Security.ReliabilityPct)
+    end
+end
+
+function Stats:Destroy()
+    self.Visible = false
+    for _, obj in ipairs(self.Objects) do
+        SafeRemoveDrawing(obj)
+    end
+    table.clear(self.Objects)
+    table.clear(self.Lines)
+end
+
+--==============================================================================
+-- 11b. Combat Module (PASSIVE: reads game state, draws on screen, nothing else)
+--      Threat HUD (counts / nearest enemy) + Threat line. Health bars and arrows
+--      live in the per-player ESP objects (section 16).
+--==============================================================================
+Combat = {
+    Objects = {},
+    Lines = {},
+    Cache = {},
+    Width = 196,
+    Height = 70,
+    HudShown = false,
+    LineShown = false,
+    LineColor = nil,
+    LineAlpha = nil,
+    LastUpdate = 0,
+    LastViewport = nil,
+    Ready = false,
+}
+
+function Combat:NewDrawing(className, props)
+    local obj = Drawing.new(className)
+    table.insert(self.Objects, obj)
+    for k, v in pairs(props) do
+        obj[k] = v
+    end
+    return obj
+end
+
+function Combat:Init()
+    local ok, err = pcall(function()
+        self.Border = self:NewDrawing("Square", {
+            Size = Vector2.new(self.Width + 4, self.Height + 4),
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true,
+            ZIndex = 5,
+            Visible = false,
+        })
+        self.Background = self:NewDrawing("Square", {
+            Size = Vector2.new(self.Width, self.Height),
+            Color = Color3.fromRGB(35, 35, 35),
+            Filled = true,
+            ZIndex = 6,
+            Visible = false,
+        })
+        self.Divider = self:NewDrawing("Line", {
+            Color = Color3.fromRGB(0, 0, 0),
+            Thickness = 2,
+            ZIndex = 7,
+            Visible = false,
+        })
+
+        local seed = { "THREAT MONITOR", "ENEMIES : 0", "NEAREST : --", "DIST/HP : --" }
+        for i, text in ipairs(seed) do
+            self.Cache[i] = text
+            self.Lines[i] = self:NewDrawing("Text", {
+                Text = text,
+                Size = 13,
+                Font = GetFont(),
+                Color = (i == 1) and Color3.fromRGB(255, 200, 60) or Color3.fromRGB(255, 255, 255),
+                Outline = true,
+                Center = false,
+                ZIndex = 7,
+                Visible = false,
+            })
+        end
+
+        self.ThreatLine = self:NewDrawing("Line", {
+            Thickness = 1,
+            Color = Color3.fromRGB(255, 255, 255),
+            Transparency = 1,
+            ZIndex = 1,
+            Visible = false,
+        })
+    end)
+
+    if ok then
+        self.Ready = true
+        self:Layout()
+    else
+        warn("[0x] Combat module failed to initialize: " .. tostring(err))
+    end
+end
+
+-- Top-right corner, follows viewport changes
+function Combat:Layout()
+    if not self.Ready then return end
+    local vp = WorldState.ViewportSize
+    local x = math.max(0, math.floor(vp.X - self.Width - 14))
+    local y = 48
+
+    self.Border.Position = Vector2.new(x - 2, y - 2)
+    self.Background.Position = Vector2.new(x, y)
+    self.Divider.From = Vector2.new(x, y + 22)
+    self.Divider.To = Vector2.new(x + self.Width, y + 22)
+    for i, line in ipairs(self.Lines) do
+        local lineY = (i == 1) and (y + 4) or (y + 12 + (i - 1) * 15)
+        line.Position = Vector2.new(x + 8, lineY)
+    end
+end
+
+function Combat:SetText(i, text)
+    if self.Cache[i] ~= text then
+        self.Cache[i] = text
+        self.Lines[i].Text = text
+    end
+end
+
+function Combat:SetHudVisible(state)
+    if self.HudShown == state then return end
+    self.HudShown = state
+    self.Border.Visible = state
+    self.Background.Visible = state
+    self.Divider.Visible = state
+    for _, line in ipairs(self.Lines) do
+        line.Visible = state
+    end
+end
+
+function Combat:HideLine()
+    if not self.LineShown then return end
+    self.LineShown = false
+    self.ThreatLine.Visible = false
+end
+
+local function CleanName(player)
+    local n = player.DisplayName
+    if type(n) ~= "string" or n == "" then
+        n = player.Name
+    end
+    n = (string.gsub(n, "[^ -~]", "")) -- printable ASCII only (Drawing fonts are not unicode-safe)
+    n = string.sub(n, 1, 14)
+    if #n == 0 then n = "?" end
+    return n
+end
+
+function Combat:Update(now, count, visCount, nearest, nearestDistSq, nearestOn, nx, ny)
+    if not self.Ready or IsUnloaded then return end
+
+    local vp = WorldState.ViewportSize
+    if vp ~= self.LastViewport then
+        self.LastViewport = vp
+        self:Layout()
+    end
+
+    -- Threat HUD (text refreshed at 10 Hz, only touches Drawings when the text changed)
+    if Config.ThreatHUD then
+        self:SetHudVisible(true)
+        if (now - self.LastUpdate) >= 0.1 then
+            self.LastUpdate = now
+            if Config.VisibilityCheck then
+                self:SetText(2, string.format("ENEMIES : %d (%d VIS)", count, visCount))
+            else
+                self:SetText(2, string.format("ENEMIES : %d", count))
+            end
+            if nearest and nearest.Player then
+                local hp = "--"
+                local hum = nearest.Humanoid
+                if hum then
+                    local maxHp = hum.MaxHealth
+                    if maxHp > 0 then
+                        hp = string.format("%d%%", math.clamp(math.floor(hum.Health / maxHp * 100 + 0.5), 0, 100))
+                    end
+                end
+                self:SetText(3, "NEAREST : " .. CleanName(nearest.Player))
+                self:SetText(4, string.format("DIST/HP : %dm / %s", math.floor(math.sqrt(nearestDistSq) + 0.5), hp))
+            else
+                self:SetText(3, "NEAREST : --")
+                self:SetText(4, "DIST/HP : --")
+            end
+        end
+    else
+        self:SetHudVisible(false)
+    end
+
+    -- Threat line (screen center -> nearest on-screen enemy)
+    if Config.ThreatLine and nearest and nearestOn then
+        local color = nearest.LastColor or Config.ColorHidden
+        local alpha = nearest.LastAlpha or Config.ColorHiddenAlpha
+        local line = self.ThreatLine
+        line.From = Vector2.new(math.floor(vp.X * 0.5), math.floor(vp.Y * 0.5))
+        line.To = Vector2.new(math.floor(nx), math.floor(ny))
+        if self.LineColor ~= color or self.LineAlpha ~= alpha then
+            self.LineColor, self.LineAlpha = color, alpha
+            line.Color = color
+            line.Transparency = alpha
+        end
+        if not self.LineShown then
+            line.Visible = true
+            self.LineShown = true
+        end
+    else
+        self:HideLine()
+    end
+end
+
+function Combat:Destroy()
+    self.Ready = false
+    for _, obj in ipairs(self.Objects) do
+        SafeRemoveDrawing(obj)
+    end
+    table.clear(self.Objects)
+    table.clear(self.Lines)
+    table.clear(self.Cache)
+    self.HudShown = false
+    self.LineShown = false
+end
+
+--==============================================================================
+-- 11c. Security Monitor (self-audit of THIS script: integrity, limits, runtime health)
+--      Group "SEC" -> Security %, Group "REL" -> Reliability %. Add checks with Security:Register().
+--==============================================================================
+local COLOR_GOOD = Color3.fromRGB(0, 255, 0)
+local COLOR_WARN = Color3.fromRGB(255, 220, 80)
+local COLOR_BAD = Color3.fromRGB(255, 80, 80)
+
+Security = {
+    Checks = {},
+    SecurityPct = 0,
+    ReliabilityPct = 0,
+    OverallPct = 0,
+    Level = 2, -- 1 = secure, 2 = caution, 3 = warning
+    Verdict = "STATUS: SCANNING",
+    Advice = "PLEASE WAIT",
+    LastScan = -10,
+}
+
+function Security:Register(def)
+    def.Score = 1
+    table.insert(self.Checks, def)
+    return def
+end
+
+function Security:ColorFor(pct)
+    if pct >= 90 then return COLOR_GOOD end
+    if pct >= 70 then return COLOR_WARN end
+    return COLOR_BAD
+end
+
+function Security:LevelColor()
+    if self.Level == 1 then return COLOR_GOOD end
+    if self.Level == 2 then return COLOR_WARN end
+    return COLOR_BAD
+end
+
+function Security:Scan()
+    local sums = { SEC = { 0, 0 }, REL = { 0, 0 } }
+    local criticalFail = false
+    local weakName, weakShortfall = nil, 0.01
+
+    for _, chk in ipairs(self.Checks) do
+        local ok, score = pcall(chk.Eval)
+        if not ok or type(score) ~= "number" or score ~= score then
+            score = 0
+        end
+        score = math.clamp(score, 0, 1)
+        chk.Score = score
+
+        local weight = chk.Weight or 1
+        local bucket = sums[chk.Group] or sums.SEC
+        bucket[1] += score * weight
+        bucket[2] += weight
+
+        if chk.Critical and score < 0.5 then
+            criticalFail = true
+        end
+        local shortfall = (1 - score) * weight
+        if shortfall > weakShortfall then
+            weakShortfall = shortfall
+            weakName = chk.Name
+        end
+    end
+
+    local sec = (sums.SEC[2] > 0) and (sums.SEC[1] / sums.SEC[2] * 100) or 100
+    local rel = (sums.REL[2] > 0) and (sums.REL[1] / sums.REL[2] * 100) or 100
+    local overall = sec * 0.55 + rel * 0.45
+    if criticalFail then
+        overall = math.min(overall, 60)
+    end
+
+    self.SecurityPct = math.clamp(math.floor(sec + 0.5), 0, 100)
+    self.ReliabilityPct = math.clamp(math.floor(rel + 0.5), 0, 100)
+    self.OverallPct = math.clamp(math.floor(overall + 0.5), 0, 100)
+    self.LastScan = os.clock()
+
+    if self.OverallPct >= 90 then
+        self.Level = 1
+        self.Verdict = string.format("OVERALL %d%%: SECURE", self.OverallPct)
+        self.Advice = "NO NEED TO WORRY"
+    elseif self.OverallPct >= 70 then
+        self.Level = 2
+        self.Verdict = string.format("OVERALL %d%%: CAUTION", self.OverallPct)
+        self.Advice = "CHECK: " .. (weakName or "SETTINGS")
+    else
+        self.Level = 3
+        self.Verdict = string.format("OVERALL %d%%: WARNING", self.OverallPct)
+        self.Advice = "FIX NOW: " .. (weakName or "SETTINGS")
+    end
+end
+
+-- Called every frame from the safe frame wrapper; re-scans once per second, only while the tab is on screen
+function Security:Tick(now)
+    if not UI or not UI.Ready or not UI.Visible then return end
+    if UI.ActiveTab ~= UI.TabIndex.SECURITY then return end
+    if (now - self.LastScan) < 1 then return end
+    self:Scan()
+    UI:RefreshActiveTab()
+end
+
+-- ---------------------------------------------------------------- SEC group
+Security:Register({
+    Id = "KILL", Name = "KILL SWITCH", Group = "SEC", Weight = 3, Critical = true,
+    Eval = function()
+        local u, m = Config.UnloadKey, Config.MenuToggleKey
+        if not IsBindableKey(u) or not IsBindableKey(m) then return 0 end
+        if u == m then return 0 end
+        return 1
+    end,
+})
+
+Security:Register({
+    Id = "CONFIG", Name = "CONFIG GUARD", Group = "SEC", Weight = 3, Critical = true,
+    Eval = function()
+        local bad = ConfigIO.Audit()
+        if bad == 0 then return 1 end
+        return math.max(0, 0.5 - bad * 0.1)
+    end,
+})
+
+Security:Register({
+    Id = "API", Name = "API LOCK", Group = "SEC", Weight = 2,
+    Eval = function()
+        local proxy = Health.ConfigProxy
+        if proxy ~= nil and getmetatable(proxy) == "locked" then return 1 end
+        return 0
+    end,
+})
+
+Security:Register({
+    Id = "INSTANCE", Name = "ONE INSTANCE", Group = "SEC", Weight = 2,
+    Eval = function()
+        if GlobalEnv.__0x_Token == Health.Token and GlobalEnv.__0x_Unload == Health.Unload then
+            return 1
+        end
+        return 0
+    end,
+})
+
+Security:Register({
+    Id = "LIMITS", Name = "SAFE LIMITS", Group = "SEC", Weight = 2,
+    Eval = function()
+        local s = 1
+        if Config.RaycastInterval < 0.02 then s -= 0.4 end
+        if Config.MaxRaysPerFrame > 32 then s -= 0.4 end
+        if Config.WallPenetrationLimit > 6 then s -= 0.2 end
+        return s
+    end,
+})
+
+Security:Register({
+    Id = "PASSIVE", Name = "PASSIVE ONLY", Group = "SEC", Weight = 3, Critical = true,
+    Eval = function()
+        local active, risky = 0, 0
+        for _, feat in ipairs(FeatureRegistry) do
+            if Config[feat.Key] == true then
+                active += 1
+                if not feat.Passive then
+                    risky += 1
+                end
+            end
+        end
+        if active == 0 then return 1 end
+        if risky == 0 then return 1 end
+        return math.max(0, 1 - (risky / active) * 1.5)
+    end,
+})
+
+-- ---------------------------------------------------------------- REL group
+Security:Register({
+    Id = "LOOP", Name = "RENDER LOOP", Group = "REL", Weight = 3,
+    Eval = function()
+        if os.clock() < Health.PausedUntil then return 0 end
+        local s = 1 - math.min(Health.LoopErrorsTotal, 25) * 0.02 - math.min(Health.LoopPauses, 3) * 0.15
+        return math.max(0, s)
+    end,
+})
+
+Security:Register({
+    Id = "FPS", Name = "FRAME RATE", Group = "REL", Weight = 2,
+    Eval = function()
+        local fps = Metrics.FPS
+        if fps <= 0 then return 1 end -- still warming up
+        if fps >= 55 then return 1 end
+        if fps >= 30 then return 0.6 + ((fps - 30) / 25) * 0.4 end
+        return (fps / 30) * 0.6
+    end,
+})
+
+Security:Register({
+    Id = "FOOTPRINT", Name = "FOOTPRINT", Group = "REL", Weight = 2,
+    Eval = function()
+        local rayLoad = math.clamp(Metrics.RaysPerSec / 1200, 0, 1)
+        local drawLoad = math.clamp(GetDrawingTotal() / 1500, 0, 1)
+        return 1 - rayLoad * 0.5 - drawLoad * 0.5
+    end,
+})
+
+Security:Register({
+    Id = "STORAGE", Name = "STORAGE", Group = "REL", Weight = 1,
+    Eval = function()
+        if not ConfigIO.IsSupported() then return 0.75 end -- harmless, just no persistence
+        if Health.LastSaveOk == false or Health.LastLoadOk == false then return 0.4 end
+        return 1
+    end,
+})
+
+Security:Register({
+    Id = "DRAW", Name = "DRAW STACK", Group = "REL", Weight = 2,
+    Eval = function()
+        local s = 1
+        if not (UI and UI.Ready) then s -= 0.25 end
+        if not (Crosshair and Crosshair.Ready) then s -= 0.25 end
+        if not (Combat and Combat.Ready) then s -= 0.25 end
+        if Health.AllocFailures > 0 then s -= 0.25 end
+        return math.max(0, s)
+    end,
+})
+
+--==============================================================================
+-- 12. Modular Tabbed Pixel UI (0x)
+--==============================================================================
+-- Maps the color-target tab to its Config keys (color + alpha)
+local TargetKeys = {
+    Hidden    = { Color = "ColorHidden",    Alpha = "ColorHiddenAlpha",    Label = "HIDDEN COLOR" },
+    Visible   = { Color = "ColorVisible",   Alpha = "ColorVisibleAlpha",   Label = "VISIBLE COLOR" },
+    Crosshair = { Color = "ColorCrosshair", Alpha = "ColorCrosshairAlpha", Label = "XHAIR COLOR" },
+    Dot       = { Color = "ColorDot",       Alpha = "ColorDotAlpha",       Label = "DOT COLOR" },
+}
+local CHANNEL_PROP = { R = "R", G = "G", B = "B" }
+local COLOR_DIM = Color3.fromRGB(150, 150, 150)
+
+UI = {
+    Visible = true,
+    Ready = false,
+    ActiveTab = 1,
+    ColorTarget = "Hidden", -- "Hidden" | "Visible" | "Crosshair" | "Dot"
+    Position = Vector2.new(60, 60),
+    Width = 220,
+    Height = 320,
+    HeaderHeight = 26,
+    TabBarHeight = 22,
+    FooterHeight = 20,
+    Padding = 10,
+
+    -- Scrollable tab strip: TabWindow tabs are visible at once, the wheel / arrows move TabOffset
+    TabWindow = 3,
+    TabOffset = 0,
+    ArrowW = 12,
+    LastWheel = 0,
+
+    Dragging = false,
+    DragOffset = Vector2.zero,
+    ActiveSlider = nil,
+
+    OwnerText = OWNER_LABEL,
+    ClockW = 56,
+    CharW = 7,
+    OwnerW = 50,
+    LastClock = nil,
+
+    Objects = {},
+    TabButtons = {},
+    TabIndex = {}, -- Id -> index (filled in Init)
+    -- Order here == order in the tab strip
+    Tabs = {
+        { Id = "VISUALS",  Name = "VISUALS",  Controls = {} },
+        { Id = "COMBAT",   Name = "COMBAT",   Controls = {} },
+        { Id = "COLORS",   Name = "COLORS",   Controls = {} },
+        { Id = "SECURITY", Name = "SECURITY", Controls = {} },
+        { Id = "SETTINGS", Name = "SETTINGS", Controls = {} },
+    },
+    StatusControl = nil,
+
+    Palette = {
+        Color3.fromRGB(255, 255, 255), -- White
+        Color3.fromRGB(0, 255, 0),     -- Green
+        Color3.fromRGB(255, 50, 50),   -- Red
+        Color3.fromRGB(255, 230, 0),   -- Yellow
+        Color3.fromRGB(0, 220, 255),   -- Cyan
+        Color3.fromRGB(255, 0, 255),   -- Magenta
+        Color3.fromRGB(255, 140, 0),   -- Orange
+        Color3.fromRGB(160, 100, 255), -- Purple
+    },
+}
+
+function UI:NewDrawing(className, props)
+    local obj = Drawing.new(className)
+    table.insert(self.Objects, obj) -- tracked first: a failed property set can never leak the object
+    for k, v in pairs(props) do
+        obj[k] = v
+    end
+    return obj
+end
+
+function UI:Changed()
+    ConfigIO.NotifyChanged()
+end
+
+function UI:GetKeys()
+    return TargetKeys[self.ColorTarget] or TargetKeys.Hidden
+end
+
+function UI:GetTargetLabel()
+    return self:GetKeys().Label
+end
+
+function UI:GetTargetColor()
+    return Config[self:GetKeys().Color]
+end
+
+function UI:SetTargetColor(col)
+    Config[self:GetKeys().Color] = col
+    if Crosshair and (self.ColorTarget == "Crosshair" or self.ColorTarget == "Dot") then
+        Crosshair:MarkDirty()
+    end
+end
+
+function UI:GetTargetAlpha()
+    return Config[self:GetKeys().Alpha]
+end
+
+function UI:GetTargetAlphaPercent()
+    return math.clamp(math.floor(self:GetTargetAlpha() * 100 + 0.5), 0, 100)
+end
+
+function UI:SetTargetAlphaPercent(pct)
+    Config[self:GetKeys().Alpha] = math.clamp(math.floor(pct + 0.5), 0, 100) / 100
+    if Crosshair and (self.ColorTarget == "Crosshair" or self.ColorTarget == "Dot") then
+        Crosshair:MarkDirty()
+    end
+end
+
+function UI:GetTargetChannel(channel)
+    return To255(self:GetTargetColor()[CHANNEL_PROP[channel] or "B"])
+end
+
+function UI:SetTargetChannel(channel, val)
+    local c = self:GetTargetColor()
+    local r, g, b = To255(c.R), To255(c.G), To255(c.B)
+    local v = math.clamp(math.floor(val + 0.5), 0, 255)
+
+    if channel == "R" then r = v
+    elseif channel == "G" then g = v
+    else b = v end
+
+    self:SetTargetColor(Color3.fromRGB(r, g, b))
+end
+
+function UI:SetStatus(msg)
+    if self.StatusControl then
+        self.StatusControl.Text = "> " .. tostring(msg)
+        self.StatusControl.Label.Text = self.StatusControl.Text
+    end
+end
+
+function UI:UpdateFooter()
+    if self.FooterText then
+        self.FooterText.Text = string.format("[%s] MENU  [%s] EXIT",
+            KeyLabel(Config.MenuToggleKey), KeyLabel(Config.UnloadKey))
+    end
+end
+
+function UI:ClampToViewport()
+    if not self.Ready then return end
+    local viewport = WorldState.ViewportSize
+    local clampedX = math.clamp(math.floor(self.Position.X), 0, math.max(0, viewport.X - self.Width))
+    local clampedY = math.clamp(math.floor(self.Position.Y), 0, math.max(0, viewport.Y - self.Height))
+    local newPos = Vector2.new(clampedX, clampedY)
+    if newPos ~= self.Position then
+        self.Position = newPos
+        self:UpdateLayout()
+    end
+end
+
+-- Header: owner badge next to "0x"
+function UI:SetOwnerLabel(text)
+    text = string.upper(tostring(text or ""))
+    text = string.gsub(text, "[^%w%s%-_%.]", "") -- sanitize
+    text = string.sub(text, 1, 10)
+    if #text == 0 then text = OWNER_LABEL end
+    self.OwnerText = text
+    if not self.Ready then return end
+    self.OwnerW = math.floor(#text * self.CharW + 10)
+    self.OwnerLabelDraw.Text = text
+    self.OwnerOuter.Size = Vector2.new(self.OwnerW, 16)
+    self.OwnerInner.Size = Vector2.new(self.OwnerW - 2, 14)
+    self:UpdateLayout()
+end
+
+-- Header: live clock on the right (only touches the Drawing when the second changes).
+-- Uses the typed os.date("*t") overload (a runtime format string triggers the
+-- 'Expected this to be "!*t" | "*t"' analyzer error).
+function UI:TickClock()
+    if not self.Ready or not self.Visible or not self.ClockDraw then return end
+    local t = os.time()
+    if t == self.LastClock then return end
+    self.LastClock = t
+
+    local text = "--:--:--"
+    local ok, d = pcall(function()
+        return os.date("*t", t)
+    end)
+    if ok and type(d) == "table" then
+        text = string.format("%02d:%02d:%02d", tonumber(d.hour) or 0, tonumber(d.min) or 0, tonumber(d.sec) or 0)
+    end
+    self.ClockDraw.Text = text
+end
+
+--==============================================================================
+-- 13. Modular UI Control Classes
+--==============================================================================
+local Controls = {}
+
+-- Vertical space a control occupies (height + gap). Gap can be overridden per control.
+local function Advance(ctrl)
+    return (ctrl.Height or 20) + (ctrl.Gap or 6)
+end
+
+Controls.checkbox = {
+    Create = function(ui, def)
+        def.Height = 20
+        def.Outer = ui:NewDrawing("Square", {
+            Size = Vector2.new(14, 14),
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true,
+            ZIndex = 2,
+            Visible = false,
+        })
+        def.Inner = ui:NewDrawing("Square", {
+            Size = Vector2.new(12, 12),
+            Color = Color3.fromRGB(20, 20, 20),
+            Filled = true,
+            ZIndex = 3,
+            Visible = false,
+        })
+        def.Fill = ui:NewDrawing("Square", {
+            Size = Vector2.new(8, 8),
+            Color = Color3.fromRGB(255, 255, 255),
+            Filled = true,
+            ZIndex = 4,
+            Visible = false,
+        })
+        def.Label = ui:NewDrawing("Text", {
+            Text = def.Text,
+            Size = 13,
+            Font = GetFont(),
+            Color = Color3.fromRGB(255, 255, 255),
+            Outline = true,
+            Center = false,
+            ZIndex = 4,
+            Visible = false,
+        })
+    end,
+
+    Layout = function(ui, def, x, y)
+        def.HitX, def.HitY, def.HitW, def.HitH = x, y, ui.Width - (ui.Padding * 2), 16
+        def.Outer.Position = Vector2.new(x, y)
+        def.Inner.Position = Vector2.new(x + 1, y + 1)
+        def.Fill.Position = Vector2.new(x + 3, y + 3)
+        def.Label.Position = Vector2.new(x + 22, y)
+    end,
+
+    Refresh = function(ui, def, visible)
+        local state = def.Get()
+        def.Outer.Visible = visible
+        def.Inner.Visible = visible
+        def.Label.Visible = visible
+        def.Fill.Visible = visible and state
+    end,
+
+    MouseDown = function(ui, def, mx, my)
+        if PointInRect(mx, my, def.HitX, def.HitY, def.HitW, def.HitH) then
+            def.Set(not def.Get())
+            ui:Refresh()
+            ui:Changed()
+            return true
+        end
+        return false
+    end,
+}
+
+Controls.slider = {
+    Create = function(ui, def)
+        def.Height = 32
+        def.BarWidth = ui.Width - (ui.Padding * 2)
+        def.Label = ui:NewDrawing("Text", {
+            Text = "",
+            Size = 13,
+            Font = GetFont(),
+            Color = Color3.fromRGB(255, 255, 255),
+            Outline = true,
+            Center = false,
+            ZIndex = 4,
+            Visible = false,
+        })
+        def.Outer = ui:NewDrawing("Square", {
+            Size = Vector2.new(def.BarWidth, 12),
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true,
+            ZIndex = 2,
+            Visible = false,
+        })
+        def.Inner = ui:NewDrawing("Square", {
+            Size = Vector2.new(def.BarWidth - 2, 10),
+            Color = Color3.fromRGB(20, 20, 20),
+            Filled = true,
+            ZIndex = 3,
+            Visible = false,
+        })
+        def.Fill = ui:NewDrawing("Square", {
+            Size = Vector2.new(0, 8),
+            Color = Color3.fromRGB(255, 255, 255),
+            Filled = true,
+            ZIndex = 4,
+            Visible = false,
+        })
+    end,
+
+    Layout = function(ui, def, x, y)
+        def.Label.Position = Vector2.new(x, y)
+        local barY = y + 15
+        def.BarX, def.BarY = x, barY
+        def.Outer.Position = Vector2.new(x, barY)
+        def.Inner.Position = Vector2.new(x + 1, barY + 1)
+        def.Fill.Position = Vector2.new(x + 2, barY + 2)
+    end,
+
+    Refresh = function(ui, def, visible)
+        local val = def.Get()
+        local range = math.max(def.Max - def.Min, 1e-6)
+        local alpha = math.clamp((val - def.Min) / range, 0, 1)
+        local maxFill = def.BarWidth - 4
+        local fillW = math.floor(maxFill * alpha + 0.5)
+
+        def.Label.Text = string.format("%s: %d%s", def.Text, math.floor(val + 0.5), def.Suffix or "")
+        def.Fill.Size = Vector2.new(math.max(fillW, 0), 8)
+
+        def.Label.Visible = visible
+        def.Outer.Visible = visible
+        def.Inner.Visible = visible
+        def.Fill.Visible = visible and (fillW > 0)
+    end,
+
+    UpdateFromMouse = function(ui, def, mx)
+        local alpha = math.clamp((mx - def.BarX) / def.BarWidth, 0, 1)
+        local raw = def.Min + (def.Max - def.Min) * alpha
+        local snapped = SnapStep(raw, def.Min, def.Max, def.Step or 1)
+        if snapped ~= def.Get() then
+            def.Set(snapped)
+            ui:Refresh()
+        end
+    end,
+
+    MouseDown = function(ui, def, mx, my)
+        if PointInRect(mx, my, def.BarX, def.BarY - 2, def.BarWidth, 16) then
+            ui.ActiveSlider = def
+            Controls.slider.UpdateFromMouse(ui, def, mx)
+            return true
+        end
+        return false
+    end,
+}
+
+Controls.buttonrow = {
+    Create = function(ui, def)
+        def.Height = 22
+        def.Items = {}
+        local count = #def.Buttons
+        local totalW = ui.Width - (ui.Padding * 2)
+        local gap = 4
+        local btnW = math.floor((totalW - (count - 1) * gap) / count)
+        def.BtnW = btnW
+        def.BtnGap = gap -- horizontal gap (def.Gap is reserved for the vertical gap, see Advance)
+
+        for i, btnSpec in ipairs(def.Buttons) do
+            def.Items[i] = {
+                Spec = btnSpec,
+                Outer = ui:NewDrawing("Square", {
+                    Size = Vector2.new(btnW, 18),
+                    Color = Color3.fromRGB(0, 0, 0),
+                    Filled = true,
+                    ZIndex = 2,
+                    Visible = false,
+                }),
+                Inner = ui:NewDrawing("Square", {
+                    Size = Vector2.new(btnW - 2, 16),
+                    Color = Color3.fromRGB(20, 20, 20),
+                    Filled = true,
+                    ZIndex = 3,
+                    Visible = false,
+                }),
+                ActiveBar = ui:NewDrawing("Square", {
+                    Size = Vector2.new(btnW - 6, 2),
+                    Color = Color3.fromRGB(255, 255, 255),
+                    Filled = true,
+                    ZIndex = 4,
+                    Visible = false,
+                }),
+                Label = ui:NewDrawing("Text", {
+                    Text = btnSpec.Text,
+                    Size = 13,
+                    Font = GetFont(),
+                    Color = Color3.fromRGB(255, 255, 255),
+                    Outline = true,
+                    Center = true,
+                    ZIndex = 4,
+                    Visible = false,
+                }),
+            }
+        end
+    end,
+
+    Layout = function(ui, def, x, y)
+        for i, item in ipairs(def.Items) do
+            local bx = x + (i - 1) * (def.BtnW + def.BtnGap)
+            item.X, item.Y, item.W, item.H = bx, y, def.BtnW, 18
+            item.Outer.Position = Vector2.new(bx, y)
+            item.Inner.Position = Vector2.new(bx + 1, y + 1)
+            item.ActiveBar.Position = Vector2.new(bx + 3, y + 14)
+            item.Label.Position = Vector2.new(bx + math.floor(def.BtnW * 0.5), y + 1)
+        end
+    end,
+
+    Refresh = function(ui, def, visible)
+        for _, item in ipairs(def.Items) do
+            local isActive = item.Spec.IsActive and item.Spec.IsActive() or false
+            item.Outer.Visible = visible
+            item.Inner.Visible = visible
+            item.Inner.Color = isActive and Color3.fromRGB(45, 45, 45) or Color3.fromRGB(20, 20, 20)
+            item.ActiveBar.Visible = visible and isActive
+            item.Label.Visible = visible
+        end
+    end,
+
+    MouseDown = function(ui, def, mx, my)
+        for _, item in ipairs(def.Items) do
+            if PointInRect(mx, my, item.X, item.Y, item.W, item.H) then
+                if item.Spec.OnClick then
+                    -- A failing handler must never break the whole UI input chain
+                    local ok, err = pcall(item.Spec.OnClick)
+                    if not ok then
+                        warn("[0x] Button error: " .. tostring(err))
+                    end
+                end
+                ui:Refresh()
+                if item.Spec.Mutates then
+                    ui:Changed()
+                end
+                return true
+            end
+        end
+        return false
+    end,
+}
+
+Controls.swatch = {
+    Create = function(ui, def)
+        def.Height = 20
+        local totalW = ui.Width - (ui.Padding * 2)
+        def.TotalW = totalW
+        def.Label = ui:NewDrawing("Text", {
+            Text = def.Text or "PREVIEW",
+            Size = 13,
+            Font = GetFont(),
+            Color = Color3.fromRGB(255, 255, 255),
+            Outline = true,
+            Center = false,
+            ZIndex = 4,
+            Visible = false,
+        })
+        def.Outer = ui:NewDrawing("Square", {
+            Size = Vector2.new(68, 14),
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true,
+            ZIndex = 2,
+            Visible = false,
+        })
+        def.Fill = ui:NewDrawing("Square", {
+            Size = Vector2.new(66, 12),
+            Color = Color3.fromRGB(255, 255, 255),
+            Filled = true,
+            Transparency = 1,
+            ZIndex = 3,
+            Visible = false,
+        })
+    end,
+
+    Layout = function(ui, def, x, y)
+        def.Label.Position = Vector2.new(x, y)
+        local sx = x + def.TotalW - 68
+        def.Outer.Position = Vector2.new(sx, y + 1)
+        def.Fill.Position = Vector2.new(sx + 1, y + 2)
+    end,
+
+    Refresh = function(ui, def, visible)
+        def.Fill.Color = def.Get()
+        def.Fill.Transparency = def.GetAlpha and def.GetAlpha() or 1
+        if def.GetText then
+            def.Label.Text = def.GetText()
+        end
+        def.Label.Visible = visible
+        def.Outer.Visible = visible
+        def.Fill.Visible = visible
+    end,
+}
+
+Controls.palette = {
+    Create = function(ui, def)
+        def.Height = 22
+        def.Cells = {}
+        local count = #ui.Palette
+        local totalW = ui.Width - (ui.Padding * 2)
+        local gap = 4
+        local cellW = math.floor((totalW - (count - 1) * gap) / count)
+        def.CellW = cellW
+        def.CellGap = gap
+
+        for i, col in ipairs(ui.Palette) do
+            def.Cells[i] = {
+                Color = col,
+                Outer = ui:NewDrawing("Square", {
+                    Size = Vector2.new(cellW, 16),
+                    Color = Color3.fromRGB(0, 0, 0),
+                    Filled = true,
+                    ZIndex = 2,
+                    Visible = false,
+                }),
+                Fill = ui:NewDrawing("Square", {
+                    Size = Vector2.new(cellW - 2, 14),
+                    Color = col,
+                    Filled = true,
+                    ZIndex = 3,
+                    Visible = false,
+                }),
+            }
+        end
+    end,
+
+    Layout = function(ui, def, x, y)
+        for i, cell in ipairs(def.Cells) do
+            local cx = x + (i - 1) * (def.CellW + def.CellGap)
+            cell.X, cell.Y, cell.W, cell.H = cx, y, def.CellW, 16
+            cell.Outer.Position = Vector2.new(cx, y)
+            cell.Fill.Position = Vector2.new(cx + 1, y + 1)
+        end
+    end,
+
+    Refresh = function(ui, def, visible)
+        for _, cell in ipairs(def.Cells) do
+            cell.Outer.Visible = visible
+            cell.Fill.Visible = visible
+        end
+    end,
+
+    MouseDown = function(ui, def, mx, my)
+        for _, cell in ipairs(def.Cells) do
+            if PointInRect(mx, my, cell.X, cell.Y, cell.W, cell.H) then
+                def.Set(cell.Color)
+                ui:Refresh()
+                ui:Changed()
+                return true
+            end
+        end
+        return false
+    end,
+}
+
+-- Static or dynamic text. Optional: GetText() -> string, GetColor() -> Color3, Color (static)
+Controls.label = {
+    Create = function(ui, def)
+        def.Height = 16
+        def.Label = ui:NewDrawing("Text", {
+            Text = def.Text or "",
+            Size = 13,
+            Font = GetFont(),
+            Color = def.Color or Color3.fromRGB(255, 255, 255),
+            Outline = true,
+            Center = false,
+            ZIndex = 4,
+            Visible = false,
+        })
+    end,
+
+    Layout = function(ui, def, x, y)
+        def.Label.Position = Vector2.new(x, y)
+    end,
+
+    Refresh = function(ui, def, visible)
+        if def.GetText then
+            def.Label.Text = def.GetText()
+        else
+            def.Label.Text = def.Text or ""
+        end
+        if def.GetColor then
+            def.Label.Color = def.GetColor()
+        end
+        def.Label.Visible = visible
+    end,
+}
+
+-- Percentage meter: Get() -> 0..100, color follows Security:ColorFor
+Controls.meter = {
+    Create = function(ui, def)
+        def.Height = 28
+        def.BarWidth = ui.Width - (ui.Padding * 2)
+        def.Label = ui:NewDrawing("Text", {
+            Text = "",
+            Size = 13,
+            Font = GetFont(),
+            Color = Color3.fromRGB(255, 255, 255),
+            Outline = true,
+            Center = false,
+            ZIndex = 4,
+            Visible = false,
+        })
+        def.Outer = ui:NewDrawing("Square", {
+            Size = Vector2.new(def.BarWidth, 10),
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true,
+            ZIndex = 2,
+            Visible = false,
+        })
+        def.Inner = ui:NewDrawing("Square", {
+            Size = Vector2.new(def.BarWidth - 2, 8),
+            Color = Color3.fromRGB(20, 20, 20),
+            Filled = true,
+            ZIndex = 3,
+            Visible = false,
+        })
+        def.Fill = ui:NewDrawing("Square", {
+            Size = Vector2.new(0, 6),
+            Color = Color3.fromRGB(0, 255, 0),
+            Filled = true,
+            ZIndex = 4,
+            Visible = false,
+        })
+    end,
+
+    Layout = function(ui, def, x, y)
+        def.Label.Position = Vector2.new(x, y)
+        def.Outer.Position = Vector2.new(x, y + 15)
+        def.Inner.Position = Vector2.new(x + 1, y + 16)
+        def.Fill.Position = Vector2.new(x + 2, y + 17)
+    end,
+
+    Refresh = function(ui, def, visible)
+        local pct = math.clamp(math.floor(def.Get() + 0.5), 0, 100)
+        local fillW = math.floor((def.BarWidth - 4) * pct / 100 + 0.5)
+        def.Label.Text = string.format("%s: %d%%", def.Text, pct)
+        def.Fill.Size = Vector2.new(math.max(fillW, 0), 6)
+        def.Fill.Color = Security:ColorFor(pct)
+        def.Label.Visible = visible
+        def.Outer.Visible = visible
+        def.Inner.Visible = visible
+        def.Fill.Visible = visible and (fillW > 0)
+    end,
+}
+
+-- Compact row: name on the left, colored percentage on the right. Get() -> 0..1
+Controls.status = {
+    Create = function(ui, def)
+        def.Height = 14
+        def.Gap = 2
+        def.Label = ui:NewDrawing("Text", {
+            Text = def.Text or "",
+            Size = 13,
+            Font = GetFont(),
+            Color = Color3.fromRGB(255, 255, 255),
+            Outline = true,
+            Center = false,
+            ZIndex = 4,
+            Visible = false,
+        })
+        def.Value = ui:NewDrawing("Text", {
+            Text = "--",
+            Size = 13,
+            Font = GetFont(),
+            Color = Color3.fromRGB(255, 255, 255),
+            Outline = true,
+            Center = false,
+            ZIndex = 4,
+            Visible = false,
+        })
+    end,
+
+    Layout = function(ui, def, x, y)
+        def.RowY = y
+        def.RightX = x + (ui.Width - ui.Padding * 2)
+        def.Label.Position = Vector2.new(x, y)
+        def.Value.Position = Vector2.new(def.RightX - math.floor(4 * ui.CharW + 0.5), y)
+    end,
+
+    Refresh = function(ui, def, visible)
+        local pct = math.clamp(math.floor(def.Get() * 100 + 0.5), 0, 100)
+        local text = string.format("%d%%", pct)
+        def.Value.Text = text
+        def.Value.Color = Security:ColorFor(pct)
+        if def.RightX then
+            def.Value.Position = Vector2.new(def.RightX - math.floor(#text * ui.CharW + 0.5), def.RowY)
+        end
+        def.Label.Visible = visible
+        def.Value.Visible = visible
+    end,
+}
+
+--==============================================================================
+-- 14. UI Construction, Layout & Input Handling
+--==============================================================================
+-- tabId: the Id string of a tab ("VISUALS", "COMBAT", ...) or its numeric index
+function UI:AddControl(tabId, def)
+    local handler = Controls[def.Type]
+    if not handler then return nil end
+    local idx = (type(tabId) == "number") and tabId or self.TabIndex[tabId]
+    local tab = idx and self.Tabs[idx]
+    if not tab then
+        warn("[0x] Unknown tab: " .. tostring(tabId))
+        return nil
+    end
+    handler.Create(self, def)
+    table.insert(tab.Controls, def)
+    return def
+end
+
+-- Shorthand: checkbox bound to a Config key. after(v) runs after the value is written.
+function UI:AddToggle(tabId, text, key, after)
+    return self:AddControl(tabId, {
+        Type = "checkbox",
+        Text = text,
+        Get = function() return Config[key] end,
+        Set = function(v)
+            Config[key] = v
+            if after then after(v) end
+        end,
+    })
+end
+
+-- Shorthand: slider bound to a Config key
+function UI:AddSlider(tabId, text, key, min, max, step, suffix, after)
+    return self:AddControl(tabId, {
+        Type = "slider",
+        Text = text,
+        Suffix = suffix or "",
+        Min = min,
+        Max = max,
+        Step = step,
+        Get = function() return Config[key] end,
+        Set = function(v)
+            Config[key] = v
+            if after then after(v) end
+        end,
+    })
+end
+
+local function MarkCrosshair()
+    if Crosshair then Crosshair:MarkDirty() end
+end
+
+function UI:BuildVisualsTab()
+    local T = "VISUALS"
+    self:AddToggle(T, "2D BOX", "ShowBox")
+    self:AddToggle(T, "CORNER BOX", "CornerBox", function(v)
+        if v then Config.ShowBox = true end
+    end)
+    self:AddToggle(T, "SKELETON", "ShowSkeleton")
+    self:AddToggle(T, "HEAD CIRCLE", "ShowHead")
+    self:AddToggle(T, "DISTANCE", "ShowDistance")
+    self:AddToggle(T, "WALL CHECK", "VisibilityCheck")
+    self:AddToggle(T, "CROSSHAIR", "ShowCrosshair", MarkCrosshair)
+    self:AddSlider(T, "XHAIR SIZE", "CrosshairSize", 2, 20, 1, "px", MarkCrosshair)
+    self:AddSlider(T, "XHAIR GAP", "CrosshairGap", 0, 16, 1, "px", MarkCrosshair)
+    self:AddToggle(T, "XHAIR DOT", "CrosshairDot", MarkCrosshair)
+    self:AddSlider(T, "DOT SIZE", "CrosshairDotSize", 1, 8, 1, "px", MarkCrosshair)
+end
+
+function UI:BuildCombatTab()
+    local T = "COMBAT"
+    self:AddControl(T, { Type = "label", Text = "PASSIVE / READ-ONLY TOOLS", Color = COLOR_DIM })
+    self:AddToggle(T, "HEALTH BAR", "HealthBar")
+    self:AddToggle(T, "OFFSCREEN ARROWS", "OffscreenArrows")
+    self:AddSlider(T, "ARROW RADIUS", "ArrowRadius", 60, 400, 5, "px")
+    self:AddSlider(T, "ARROW SIZE", "ArrowSize", 6, 24, 1, "px")
+    self:AddToggle(T, "THREAT HUD", "ThreatHUD")
+    self:AddToggle(T, "THREAT LINE", "ThreatLine")
+    self:AddControl(T, { Type = "label", Text = "NO INPUT / NO REMOTES", Color = COLOR_DIM })
+end
+
+function UI:BuildColorsTab()
+    local T = "COLORS"
+    self:AddControl(T, {
+        Type = "buttonrow",
+        Buttons = {
+            {
+                Text = "HID",
+                IsActive = function() return self.ColorTarget == "Hidden" end,
+                OnClick = function() self.ColorTarget = "Hidden" end,
+            },
+            {
+                Text = "VIS",
+                IsActive = function() return self.ColorTarget == "Visible" end,
+                OnClick = function() self.ColorTarget = "Visible" end,
+            },
+            {
+                Text = "XHAIR",
+                IsActive = function() return self.ColorTarget == "Crosshair" end,
+                OnClick = function() self.ColorTarget = "Crosshair" end,
+            },
+            {
+                Text = "DOT",
+                IsActive = function() return self.ColorTarget == "Dot" end,
+                OnClick = function() self.ColorTarget = "Dot" end,
+            },
+        },
+    })
+    local channels = { { "RED", "R" }, { "GREEN", "G" }, { "BLUE", "B" } }
+    for _, ch in ipairs(channels) do
+        self:AddControl(T, {
+            Type = "slider",
+            Text = ch[1],
+            Suffix = "",
+            Min = 0,
+            Max = 255,
+            Step = 1,
+            Get = function() return self:GetTargetChannel(ch[2]) end,
+            Set = function(v) self:SetTargetChannel(ch[2], v) end,
+        })
+    end
+    self:AddControl(T, {
+        Type = "slider",
+        Text = "ALPHA",
+        Suffix = "%",
+        Min = 0,
+        Max = 100,
+        Step = 1,
+        Get = function() return self:GetTargetAlphaPercent() end,
+        Set = function(v) self:SetTargetAlphaPercent(v) end,
+    })
+    self:AddControl(T, {
+        Type = "swatch",
+        Text = "HIDDEN COLOR",
+        Get = function() return self:GetTargetColor() end,
+        GetAlpha = function() return self:GetTargetAlpha() end,
+        GetText = function() return self:GetTargetLabel() end,
+    })
+    self:AddControl(T, {
+        Type = "palette",
+        Set = function(col) self:SetTargetColor(col) end,
+    })
+end
+
+function UI:BuildSecurityTab()
+    local T = "SECURITY"
+    self:AddControl(T, {
+        Type = "meter",
+        Text = "SECURITY",
+        Get = function() return Security.SecurityPct end,
+    })
+    self:AddControl(T, {
+        Type = "meter",
+        Text = "RELIABILITY",
+        Get = function() return Security.ReliabilityPct end,
+    })
+    self:AddControl(T, {
+        Type = "label",
+        GetText = function() return Security.Verdict end,
+        GetColor = function() return Security:LevelColor() end,
+    })
+    self:AddControl(T, {
+        Type = "label",
+        GetText = function() return Security.Advice end,
+        GetColor = function() return Security:LevelColor() end,
+    })
+    for _, chk in ipairs(Security.Checks) do
+        self:AddControl(T, {
+            Type = "status",
+            Text = chk.Name,
+            Get = function() return chk.Score end,
+        })
+    end
+    self:AddControl(T, { Type = "label", Text = "SELF-AUDIT ONLY, NOT A GUARANTEE", Color = COLOR_DIM })
+
+    -- Fresh numbers the moment the tab is opened
+    local tab = self.Tabs[self.TabIndex[T]]
+    if tab then
+        tab.OnShow = function() Security:Scan() end
+    end
+end
+
+function UI:BuildSettingsTab()
+    local T = "SETTINGS"
+    self:AddSlider(T, "MAX DIST", "MaxDistance", DefaultConfig.MinDistanceLimit,
+        DefaultConfig.MaxDistanceLimit, DefaultConfig.DistanceStep, "m")
+    self:AddToggle(T, "DEBUG OVERLAY", "ShowStats", function(v)
+        if Stats then Stats:SetVisible(v) end
+    end)
+    self:AddToggle(T, "TEAM CHECK", "TeamCheck")
+    self:AddToggle(T, "AUTO-SAVE", "AutoSave")
+
+    local slotButtons = {}
+    for n = 1, ConfigIO.MaxSlots do
+        slotButtons[n] = {
+            Text = "SLOT " .. n,
+            IsActive = function() return ConfigIO.Slot == n end,
+            OnClick = function()
+                local _, msg = ConfigIO.SetSlot(n)
+                self:SetStatus(msg)
+            end,
+        }
+    end
+    self:AddControl(T, { Type = "buttonrow", Buttons = slotButtons })
+    self:AddControl(T, {
+        Type = "buttonrow",
+        Buttons = {
+            {
+                Text = "SAVE",
+                OnClick = function()
+                    local _, msg = ConfigIO.Save()
+                    self:SetStatus(msg)
+                end,
+            },
+            {
+                Text = "LOAD",
+                OnClick = function()
+                    local _, msg = ConfigIO.Load(false)
+                    self:SetStatus(msg)
+                end,
+            },
+            {
+                Text = "RESET",
+                Mutates = true,
+                OnClick = function()
+                    local _, msg = ConfigIO.Reset()
+                    self:SetStatus(msg)
+                end,
+            },
+        },
+    })
+    self.StatusControl = self:AddControl(T, {
+        Type = "label",
+        Text = "> READY",
+    })
+end
+
+function UI:BuildSpecs()
+    self:BuildVisualsTab()
+    self:BuildCombatTab()
+    self:BuildColorsTab()
+    self:BuildSecurityTab()
+    self:BuildSettingsTab()
+end
+
+function UI:Init()
+    local ok, err = pcall(function()
+        for i, tab in ipairs(self.Tabs) do
+            self.TabIndex[tab.Id] = i
+        end
+
+        self.OuterBorder = self:NewDrawing("Square", {
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true,
+            ZIndex = 1,
+            Visible = true,
+        })
+        self.Background = self:NewDrawing("Square", {
+            Color = Color3.fromRGB(35, 35, 35),
+            Filled = true,
+            ZIndex = 2,
+            Visible = true,
+        })
+        self.TitleText = self:NewDrawing("Text", {
+            Text = "0x",
+            Size = 14,
+            Font = GetFont(),
+            Color = Color3.fromRGB(255, 255, 255),
+            Outline = true,
+            Center = false,
+            ZIndex = 4,
+            Visible = true,
+        })
+
+        -- Header: owner badge (next to "0x")
+        self.OwnerOuter = self:NewDrawing("Square", {
+            Size = Vector2.new(self.OwnerW, 16),
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true,
+            ZIndex = 3,
+            Visible = true,
+        })
+        self.OwnerInner = self:NewDrawing("Square", {
+            Size = Vector2.new(self.OwnerW - 2, 14),
+            Color = Color3.fromRGB(20, 20, 20),
+            Filled = true,
+            ZIndex = 4,
+            Visible = true,
+        })
+        self.OwnerLabelDraw = self:NewDrawing("Text", {
+            Text = self.OwnerText,
+            Size = 12,
+            Font = GetFont(),
+            Color = Color3.fromRGB(255, 200, 60),
+            Outline = true,
+            Center = true,
+            ZIndex = 5,
+            Visible = true,
+        })
+
+        -- Header: clock (right side)
+        self.ClockDraw = self:NewDrawing("Text", {
+            Text = "00:00:00",
+            Size = 13,
+            Font = GetFont(),
+            Color = Color3.fromRGB(200, 200, 200),
+            Outline = true,
+            Center = false,
+            ZIndex = 4,
+            Visible = true,
+        })
+
+        -- Measure the monospace glyph width once (fixed-width "00:00:00" => stable right alignment)
+        local okB, tb = pcall(function() return self.ClockDraw.TextBounds end)
+        local measured = (okB and typeof(tb) == "Vector2") and tb.X or 0
+        if measured < 20 or measured > 120 then
+            measured = 56
+        end
+        self.ClockW = math.floor(measured + 0.5)
+        self.CharW = measured / 8
+        self.OwnerW = math.floor(#self.OwnerText * self.CharW + 10)
+        self.OwnerOuter.Size = Vector2.new(self.OwnerW, 16)
+        self.OwnerInner.Size = Vector2.new(self.OwnerW - 2, 14)
+
+        self.HeaderLine = self:NewDrawing("Line", {
+            Color = Color3.fromRGB(0, 0, 0),
+            Thickness = 2,
+            ZIndex = 3,
+            Visible = true,
+        })
+        self.TabLine = self:NewDrawing("Line", {
+            Color = Color3.fromRGB(0, 0, 0),
+            Thickness = 2,
+            ZIndex = 3,
+            Visible = true,
+        })
+
+        -- Tab strip: one button per tab (only TabWindow of them are shown at a time)
+        self.TabWindow = math.clamp(self.TabWindow, 1, #self.Tabs)
+        for i, tab in ipairs(self.Tabs) do
+            self.TabButtons[i] = {
+                Width = 60,
+                Bg = self:NewDrawing("Square", {
+                    Size = Vector2.new(60, self.TabBarHeight),
+                    Color = Color3.fromRGB(20, 20, 20),
+                    Filled = true,
+                    ZIndex = 3,
+                    Visible = false,
+                }),
+                Indicator = self:NewDrawing("Square", {
+                    Size = Vector2.new(54, 2),
+                    Color = Color3.fromRGB(255, 255, 255),
+                    Filled = true,
+                    ZIndex = 4,
+                    Visible = false,
+                }),
+                Label = self:NewDrawing("Text", {
+                    Text = tab.Name,
+                    Size = 13,
+                    Font = GetFont(),
+                    Color = Color3.fromRGB(255, 255, 255),
+                    Outline = true,
+                    Center = true,
+                    ZIndex = 4,
+                    Visible = false,
+                }),
+            }
+        end
+
+        -- Tab strip scroll arrows
+        self.ArrowLBg = self:NewDrawing("Square", {
+            Size = Vector2.new(self.ArrowW, self.TabBarHeight),
+            Color = Color3.fromRGB(20, 20, 20),
+            Filled = true,
+            ZIndex = 3,
+            Visible = false,
+        })
+        self.ArrowLText = self:NewDrawing("Text", {
+            Text = "<",
+            Size = 13,
+            Font = GetFont(),
+            Color = Color3.fromRGB(255, 255, 255),
+            Outline = true,
+            Center = true,
+            ZIndex = 4,
+            Visible = false,
+        })
+        self.ArrowRBg = self:NewDrawing("Square", {
+            Size = Vector2.new(self.ArrowW, self.TabBarHeight),
+            Color = Color3.fromRGB(20, 20, 20),
+            Filled = true,
+            ZIndex = 3,
+            Visible = false,
+        })
+        self.ArrowRText = self:NewDrawing("Text", {
+            Text = ">",
+            Size = 13,
+            Font = GetFont(),
+            Color = Color3.fromRGB(255, 255, 255),
+            Outline = true,
+            Center = true,
+            ZIndex = 4,
+            Visible = false,
+        })
+
+        self.FooterText = self:NewDrawing("Text", {
+            Text = "[RSHIFT] MENU  [DEL] EXIT",
+            Size = 13,
+            Font = GetFont(),
+            Color = Color3.fromRGB(200, 200, 200),
+            Outline = true,
+            Center = true,
+            ZIndex = 4,
+            Visible = true,
+        })
+
+        self:BuildSpecs()
+
+        local maxTabH = 0
+        for _, tab in ipairs(self.Tabs) do
+            local h = 0
+            for _, ctrl in ipairs(tab.Controls) do
+                h += Advance(ctrl)
+            end
+            if h > maxTabH then maxTabH = h end
+        end
+        self.Height = self.HeaderHeight + self.TabBarHeight + 12 + maxTabH + self.FooterHeight + 6
+    end)
+
+    if ok then
+        self.Ready = true
+        self:ClampToViewport()
+        self:UpdateFooter()
+        self:UpdateLayout()
+        self:Refresh()
+    else
+        warn("[0x] UI failed to initialize: " .. tostring(err))
+    end
+end
+
+function UI:IsTabInWindow(i)
+    return i >= (self.TabOffset + 1) and i <= (self.TabOffset + self.TabWindow)
+end
+
+-- Positions the visible slice of the tab strip + the two scroll arrows
+function UI:LayoutTabStrip()
+    local x = math.floor(self.Position.X)
+    local tabY = math.floor(self.Position.Y) + self.HeaderHeight + 1
+    local areaW = self.Width - self.ArrowW * 2
+    local tabW = math.floor(areaW / self.TabWindow)
+    local lastW = areaW - tabW * (self.TabWindow - 1)
+    local firstIdx = self.TabOffset + 1
+
+    for i, btn in ipairs(self.TabButtons) do
+        if self:IsTabInWindow(i) then
+            local slot = i - firstIdx
+            local w = (slot == self.TabWindow - 1) and lastW or tabW
+            local bx = x + self.ArrowW + slot * tabW
+            btn.Width = w
+            btn.X, btn.Y, btn.W, btn.H = bx, tabY, w, self.TabBarHeight
+            btn.Bg.Position = Vector2.new(bx, tabY)
+            btn.Bg.Size = Vector2.new(w, self.TabBarHeight)
+            btn.Indicator.Position = Vector2.new(bx + 3, tabY + self.TabBarHeight - 3)
+            btn.Indicator.Size = Vector2.new(math.max(w - 6, 1), 2)
+            btn.Label.Position = Vector2.new(bx + math.floor(w * 0.5), tabY + 3)
+        end
+    end
+
+    local rx = x + self.Width - self.ArrowW
+    self.ArrowL = { X = x, Y = tabY, W = self.ArrowW, H = self.TabBarHeight }
+    self.ArrowR = { X = rx, Y = tabY, W = self.ArrowW, H = self.TabBarHeight }
+    self.ArrowLBg.Position = Vector2.new(x, tabY)
+    self.ArrowLText.Position = Vector2.new(x + math.floor(self.ArrowW * 0.5), tabY + 3)
+    self.ArrowRBg.Position = Vector2.new(rx, tabY)
+    self.ArrowRText.Position = Vector2.new(rx + math.floor(self.ArrowW * 0.5), tabY + 3)
+end
+
+function UI:UpdateLayout()
+    if not self.Ready then return end
+    local x = math.floor(self.Position.X)
+    local y = math.floor(self.Position.Y)
+    local w = self.Width
+    local h = self.Height
+
+    self.OuterBorder.Position = Vector2.new(x - 2, y - 2)
+    self.OuterBorder.Size = Vector2.new(w + 4, h + 4)
+
+    self.Background.Position = Vector2.new(x, y)
+    self.Background.Size = Vector2.new(w, h)
+
+    self.TitleText.Position = Vector2.new(x + 8, y + 5)
+
+    -- Owner badge (next to "0x")
+    local bx = x + 30
+    self.OwnerOuter.Position = Vector2.new(bx, y + 5)
+    self.OwnerInner.Position = Vector2.new(bx + 1, y + 6)
+    self.OwnerLabelDraw.Position = Vector2.new(bx + math.floor(self.OwnerW * 0.5), y + 6)
+
+    -- Clock (right-aligned)
+    self.ClockDraw.Position = Vector2.new(x + w - 8 - self.ClockW, y + 6)
+
+    local headerBottomY = y + self.HeaderHeight
+    self.HeaderLine.From = Vector2.new(x, headerBottomY)
+    self.HeaderLine.To = Vector2.new(x + w, headerBottomY)
+
+    self:LayoutTabStrip()
+
+    local tabBottomY = headerBottomY + 1 + self.TabBarHeight
+    self.TabLine.From = Vector2.new(x, tabBottomY)
+    self.TabLine.To = Vector2.new(x + w, tabBottomY)
+
+    local contentStartX = x + self.Padding
+    local contentStartY = tabBottomY + 10
+
+    for _, tab in ipairs(self.Tabs) do
+        local cy = contentStartY
+        for _, ctrl in ipairs(tab.Controls) do
+            local handler = Controls[ctrl.Type]
+            if handler and handler.Layout then
+                handler.Layout(self, ctrl, contentStartX, cy)
+            end
+            cy += Advance(ctrl)
+        end
+    end
+
+    self.FooterText.Position = Vector2.new(x + math.floor(w * 0.5), y + h - self.FooterHeight)
+end
+
+function UI:Refresh()
+    if not self.Ready then return end
+    local vis = self.Visible
+
+    self.OuterBorder.Visible = vis
+    self.Background.Visible = vis
+    self.TitleText.Visible = vis
+    self.OwnerOuter.Visible = vis
+    self.OwnerInner.Visible = vis
+    self.OwnerLabelDraw.Visible = vis
+    self.ClockDraw.Visible = vis
+    self.HeaderLine.Visible = vis
+    self.TabLine.Visible = vis
+    self.FooterText.Visible = vis
+
+    self.LastClock = nil -- force a fresh clock text when the menu is (re)shown
+    self:TickClock()
+
+    -- Tab strip (only the visible window is drawn)
+    for i, btn in ipairs(self.TabButtons) do
+        local show = vis and self:IsTabInWindow(i)
+        local active = (i == self.ActiveTab)
+        btn.Bg.Visible = show
+        btn.Bg.Color = active and Color3.fromRGB(35, 35, 35) or Color3.fromRGB(20, 20, 20)
+        btn.Indicator.Visible = show and active
+        btn.Label.Visible = show
+    end
+
+    local canLeft = self.TabOffset > 0
+    local canRight = self.TabOffset < (#self.Tabs - self.TabWindow)
+    self.ArrowLBg.Visible = vis
+    self.ArrowRBg.Visible = vis
+    self.ArrowLText.Visible = vis
+    self.ArrowRText.Visible = vis
+    self.ArrowLText.Color = canLeft and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(80, 80, 80)
+    self.ArrowRText.Color = canRight and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(80, 80, 80)
+
+    for tabIdx, tab in ipairs(self.Tabs) do
+        local tabVisible = vis and (tabIdx == self.ActiveTab)
+        for _, ctrl in ipairs(tab.Controls) do
+            local handler = Controls[ctrl.Type]
+            if handler and handler.Refresh then
+                handler.Refresh(self, ctrl, tabVisible)
+            end
+        end
+    end
+end
+
+-- Cheap refresh of the controls of the active tab only (used for live data such as the Security tab)
+function UI:RefreshActiveTab()
+    if not self.Ready or not self.Visible then return end
+    local tab = self.Tabs[self.ActiveTab]
+    if not tab then return end
+    for _, ctrl in ipairs(tab.Controls) do
+        local handler = Controls[ctrl.Type]
+        if handler and handler.Refresh then
+            handler.Refresh(self, ctrl, true)
+        end
+    end
+end
+
+function UI:SetVisible(state)
+    local target = state == true
+    if self.Visible == target then return end
+    self.Visible = target
+    if not target then
+        self.Dragging = false
+        self.ActiveSlider = nil
+    end
+    self:Refresh()
+end
+
+-- Moves the tab strip window by `delta` tabs. Returns true when it actually moved.
+function UI:ScrollTabs(delta)
+    if not self.Ready then return false end
+    local maxOffset = math.max(0, #self.Tabs - self.TabWindow)
+    local newOffset = math.clamp(self.TabOffset + delta, 0, maxOffset)
+    if newOffset == self.TabOffset then return false end
+    self.TabOffset = newOffset
+    self.ActiveSlider = nil
+    self:LayoutTabStrip()
+    self:Refresh()
+    return true
+end
+
+-- Scrolls the strip (if needed) so tab i is inside the visible window. Returns true if it scrolled.
+function UI:EnsureTabVisible(i)
+    local maxOffset = math.max(0, #self.Tabs - self.TabWindow)
+    local newOffset = self.TabOffset
+    if i < self.TabOffset + 1 then
+        newOffset = i - 1
+    elseif i > self.TabOffset + self.TabWindow then
+        newOffset = i - self.TabWindow
+    end
+    newOffset = math.clamp(newOffset, 0, maxOffset)
+    if newOffset ~= self.TabOffset then
+        self.TabOffset = newOffset
+        self:LayoutTabStrip()
+        return true
+    end
+    return false
+end
+
+function UI:SetActiveTab(i)
+    local tab = self.Tabs[i]
+    if not tab or self.ActiveTab == i then return end
+    self.ActiveTab = i
+    self.ActiveSlider = nil
+    self:EnsureTabVisible(i)
+    if tab.OnShow then
+        local ok, err = pcall(tab.OnShow)
+        if not ok then
+            warn("[0x] Tab OnShow error: " .. tostring(err))
+        end
+    end
+    self:Refresh()
+end
+
+-- Mouse wheel anywhere over the menu scrolls the tab strip (debounced for touchpads)
+function UI:OnWheel(mousePos, direction)
+    if not self.Visible or not self.Ready then return end
+    if not PointInRect(mousePos.X, mousePos.Y, self.Position.X, self.Position.Y, self.Width, self.Height) then
+        return
+    end
+    local now = os.clock()
+    if (now - self.LastWheel) < 0.07 then return end
+    self.LastWheel = now
+    self:ScrollTabs(direction > 0 and -1 or 1)
+end
+
+function UI:OnMouseDown(mousePos)
+    if not self.Visible or not self.Ready then return end
+    local mx, my = mousePos.X, mousePos.Y
+    local x, y = self.Position.X, self.Position.Y
+
+    -- Header Drag Check
+    if PointInRect(mx, my, x, y, self.Width, self.HeaderHeight) then
+        self.Dragging = true
+        self.DragOffset = mousePos - self.Position
+        return
+    end
+
+    -- Tab strip arrows
+    local al, ar = self.ArrowL, self.ArrowR
+    if al and PointInRect(mx, my, al.X, al.Y, al.W, al.H) then
+        self:ScrollTabs(-1)
+        return
+    end
+    if ar and PointInRect(mx, my, ar.X, ar.Y, ar.W, ar.H) then
+        self:ScrollTabs(1)
+        return
+    end
+
+    -- Tab Switch Check (visible window only)
+    for i, btn in ipairs(self.TabButtons) do
+        if self:IsTabInWindow(i) and PointInRect(mx, my, btn.X, btn.Y, btn.W, btn.H) then
+            self:SetActiveTab(i)
+            return
+        end
+    end
+
+    -- Active Tab Controls Check
+    local activeTab = self.Tabs[self.ActiveTab]
+    if activeTab then
+        for _, ctrl in ipairs(activeTab.Controls) do
+            local handler = Controls[ctrl.Type]
+            if handler and handler.MouseDown then
+                if handler.MouseDown(self, ctrl, mx, my) then
+                    return
+                end
+            end
+        end
+    end
+end
+
+function UI:OnMouseMove(mousePos)
+    if not self.Visible or not self.Ready then return end
+
+    if self.Dragging then
+        local viewport = WorldState.ViewportSize
+        local rawPos = mousePos - self.DragOffset
+        local clampedX = math.clamp(math.floor(rawPos.X + 0.5), 0, math.max(0, viewport.X - self.Width))
+        local clampedY = math.clamp(math.floor(rawPos.Y + 0.5), 0, math.max(0, viewport.Y - self.Height))
+        local newPos = Vector2.new(clampedX, clampedY)
+        if newPos ~= self.Position then
+            self.Position = newPos
+            self:UpdateLayout()
+        end
+        return
+    end
+
+    if self.ActiveSlider then
+        Controls.slider.UpdateFromMouse(self, self.ActiveSlider, mousePos.X)
+    end
+end
+
+function UI:OnMouseUp()
+    local interacting = self.Dragging or self.ActiveSlider ~= nil
+    self.Dragging = false
+    self.ActiveSlider = nil
+    if interacting then
+        self:Changed()
+    end
+end
+
+function UI:Destroy()
+    self.Ready = false
+    self.Dragging = false
+    self.ActiveSlider = nil
+    for _, obj in ipairs(self.Objects) do
+        SafeRemoveDrawing(obj)
+    end
+    table.clear(self.Objects)
+end
+
+--==============================================================================
+-- 15. Smart Staggered Dual-Point Wall-Check Raycast
+--==============================================================================
+local function CastPenetratingRay(data, cameraPos, targetPos, character, baseFilterCount)
+    local filter = data.FilterTable
+    -- Trim any extra penetrated parts from previous casts
+    for i = #filter, baseFilterCount + 1, -1 do
+        filter[i] = nil
+    end
+
+    local params = data.RayParams
+    params.FilterDescendantsInstances = filter
+
+    local currentOrigin = cameraPos
+
+    for _ = 1, Config.WallPenetrationLimit do
+        local direction = targetPos - currentOrigin
+        local dist = direction.Magnitude
+        if dist < 0.5 then
+            return true
+        end
+
+        Metrics.RayCount += 1
+        Metrics.FrameRays += 1
+        local result = Workspace:Raycast(currentOrigin, direction, params)
+
+        if not result then
+            return true
+        end
+
+        local hitPart = result.Instance
+        if not hitPart or hitPart:IsDescendantOf(character) then
+            return true
+        end
+
+        if hitPart.Transparency > 0.5 or not hitPart.CanCollide then
+            filter[#filter + 1] = hitPart
+            params.FilterDescendantsInstances = filter
+            currentOrigin = result.Position + (direction / dist) * 0.05
+        else
+            return false
+        end
+    end
+
+    return false
+end
+
+local function CheckCharacterVisibility(data, now, cameraPos, headPos, rootPos, character, localChar)
+    if (now - data.LastRayTime) < Config.RaycastInterval then
+        return data.CachedVisible
+    end
+    -- Global per-frame budget: defer (without consuming the interval) when exhausted
+    if Metrics.FrameRays >= Config.MaxRaysPerFrame then
+        return data.CachedVisible
+    end
+    data.LastRayTime = now
+
+    local filter = data.FilterTable
+    filter[1] = WorldState.Camera
+    local baseCount = 1
+    if localChar then
+        filter[2] = localChar
+        baseCount = 2
+    end
+
+    -- Primary ray: Camera -> Head
+    local visible = CastPenetratingRay(data, cameraPos, headPos, character, baseCount)
+
+    -- Fallback ray: Camera -> Torso/RootPart (if head is behind a thin beam/sign)
+    if not visible and rootPos then
+        visible = CastPenetratingRay(data, cameraPos, rootPos, character, baseCount)
+    end
+
+    data.CachedVisible = visible
+    return visible
+end
+
+--==============================================================================
+-- 16. Zero-Allocation ESP Engine & Self-Healing Character Tracker
+--==============================================================================
+local function HideSkeletonLines(data, fromIdx)
+    local skelLines = data.SkeletonLines
+    local lineShown = data.LineShown
+    for i = fromIdx, 14 do
+        if lineShown[i] then
+            skelLines[i].Visible = false
+            lineShown[i] = false
+        end
+    end
+    if fromIdx == 1 then
+        data.SkelShown = false
+    end
+end
+
+local function HideCornerLines(data)
+    if not data.CornerShown then return end
+    data.CornerShown = false
+    local cLines = data.CornerLines
+    for i = 1, 8 do
+        cLines[i].Visible = false
+    end
+end
+
+local function HideArrow(data)
+    if not data.ArrowShown then return end
+    data.ArrowShown = false
+    data.ArrowLines[1].Visible = false
+    data.ArrowLines[2].Visible = false
+end
+
+local function HideHealth(data)
+    if not data.HealthShown then return end
+    data.HealthShown = false
+    data.HealthOutline.Visible = false
+    data.HealthFill.Visible = false
+end
+
+-- Hides everything attached to the character body (gated by the Hidden flag).
+-- Off-screen arrows are managed independently (they are shown precisely while the body is hidden).
+local function HideESPBody(data)
+    if not data or data.Hidden or data.Destroyed then return end
+    data.Hidden = true
+
+    if data.BoxShown then
+        data.Box.Visible = false
+        data.BoxShown = false
+    end
+    if data.CornerShown then
+        HideCornerLines(data)
+    end
+    if data.HeadShown then
+        data.Head.Visible = false
+        data.HeadShown = false
+    end
+    if data.TextShown then
+        data.Text.Visible = false
+        data.TextShown = false
+    end
+    if data.HealthShown then
+        HideHealth(data)
+    end
+    if data.SkelShown then
+        HideSkeletonLines(data, 1)
+    end
+end
+
+-- Hides everything (body + arrow)
+local function HideESPData(data)
+    if not data or data.Destroyed then return end
+    if data.ArrowShown then
+        HideArrow(data)
+    end
+    HideESPBody(data)
+end
+
+local function HideAllESP()
+    for _, data in pairs(ESPCache) do
+        HideESPData(data)
+    end
+    Metrics.ActiveESPCount = 0
+end
+
+-- Draws the 2-line chevron pointing toward an off-screen enemy
+local function PlaceArrow(data, cx, cy, dx, dy, radius, size, color, alpha)
+    local tipX = cx + dx * radius
+    local tipY = cy + dy * radius
+    local backX = tipX - dx * size
+    local backY = tipY - dy * size
+    local px = -dy * size * 0.6
+    local py = dx * size * 0.6
+
+    local a = data.ArrowLines
+    a[1].From = Vector2.new(math.floor(tipX + 0.5), math.floor(tipY + 0.5))
+    a[1].To = Vector2.new(math.floor(backX + px + 0.5), math.floor(backY + py + 0.5))
+    a[2].From = a[1].From
+    a[2].To = Vector2.new(math.floor(backX - px + 0.5), math.floor(backY - py + 0.5))
+
+    if data.ArrowColor ~= color or data.ArrowAlpha ~= alpha then
+        data.ArrowColor = color
+        data.ArrowAlpha = alpha
+        a[1].Color = color
+        a[1].Transparency = alpha
+        a[2].Color = color
+        a[2].Transparency = alpha
+    end
+
+    if not data.ArrowShown then
+        a[1].Visible = true
+        a[2].Visible = true
+        data.ArrowShown = true
+    end
+end
+
+-- Re-applies thickness / size to every drawing of one player (on config change)
+local function ApplyStyle(data)
+    data.StyleVersion = StyleVersion
+    data.Box.Thickness = Config.BoxThickness
+    data.Head.Thickness = Config.HeadThickness
+    data.Text.Size = Config.TextSize
+    local skelLines = data.SkeletonLines
+    for i = 1, 14 do
+        skelLines[i].Thickness = Config.SkeletonThickness
+    end
+    local cornerLines = data.CornerLines
+    for i = 1, 8 do
+        cornerLines[i].Thickness = Config.BoxThickness
+    end
+    data.LastColor = nil -- force color/alpha re-push
+    data.ArrowColor = nil
+    data.LastHp = -1
+end
+
+local function ApplyRigProfile(data, rigType)
+    if data.RigType == rigType then return end
+    data.RigType = rigType
+
+    if rigType == "R15" then
+        data.NameMap = R15_NAME_TO_INDEX
+        data.Bones = R15_BONES
+        data.BoneCount = 14
+        data.PartCount = 15
+        data.LowestIndices = R15_LOWEST_INDICES
+    elseif rigType == "R6" then
+        data.NameMap = R6_NAME_TO_INDEX
+        data.Bones = R6_BONES
+        data.BoneCount = 5
+        data.PartCount = 6
+        data.LowestIndices = R6_LOWEST_INDICES
+        HideSkeletonLines(data, 6)
+    else
+        data.NameMap = nil
+        data.Bones = nil
+        data.BoneCount = 0
+        data.PartCount = 0
+        data.LowestIndices = nil
+    end
+
+    -- Populate indexed PartArray from currently present children
+    table.clear(data.PartArray)
+    local char = data.Character
+    local nameMap = data.NameMap
+    if char and nameMap then
+        for _, child in ipairs(char:GetChildren()) do
+            if child:IsA("BasePart") then
+                local idx = nameMap[child.Name]
+                if idx then
+                    data.PartArray[idx] = child
+                end
+            end
+        end
+    end
+end
+
+local function CreateESPObject(player)
+    if player == LocalPlayer or ESPCache[player] or IsUnloaded then
+        return
+    end
+
+    local allocated = {}
+    local function TrackDrawing(className, props)
+        local obj = Drawing.new(className)
+        table.insert(allocated, obj)
+        for k, v in pairs(props) do
+            obj[k] = v
+        end
+        return obj
+    end
+
+    PlayerSeedCounter += 1
+    -- Golden-ratio phase offset to distribute raycasts smoothly across frames
+    local rayPhaseOffset = (PlayerSeedCounter * 0.61803398875) % 1
+    local startAlpha = Config.ColorHiddenAlpha
+
+    local ok, data = pcall(function()
+        local box = TrackDrawing("Square", {
+            Thickness = Config.BoxThickness,
+            Filled = false,
+            Color = Config.ColorHidden,
+            Transparency = startAlpha,
+            ZIndex = 0,
+            Visible = false,
+        })
+
+        local head = TrackDrawing("Circle", {
+            Thickness = Config.HeadThickness,
+            NumSides = HEAD_NUM_SIDES,
+            Filled = false,
+            Color = Config.ColorHidden,
+            Transparency = startAlpha,
+            ZIndex = 0,
+            Visible = false,
+        })
+
+        local text = TrackDrawing("Text", {
+            Size = Config.TextSize,
+            Font = GetFont(),
+            Center = true,
+            Outline = true,
+            Color = Config.ColorHidden,
+            Transparency = startAlpha,
+            ZIndex = 0,
+            Visible = false,
+        })
+
+        local skeletonLines = table.create(14)
+        local lineShown = table.create(14, false)
+        for i = 1, 14 do
+            skeletonLines[i] = TrackDrawing("Line", {
+                Thickness = Config.SkeletonThickness,
+                Color = Config.ColorHidden,
+                Transparency = startAlpha,
+                ZIndex = 0,
+                Visible = false,
+            })
+        end
+
+        local cornerLines = table.create(8)
+        for i = 1, 8 do
+            cornerLines[i] = TrackDrawing("Line", {
+                Thickness = Config.BoxThickness,
+                Color = Config.ColorHidden,
+                Transparency = startAlpha,
+                ZIndex = 0,
+                Visible = false,
+            })
+        end
+
+        -- Combat: health bar (outline + fill) and off-screen arrow (2 lines)
+        local healthOutline = TrackDrawing("Square", {
+            Size = Vector2.new(4, 4),
+            Color = Color3.fromRGB(0, 0, 0),
+            Filled = true,
+            Transparency = 1,
+            ZIndex = 0,
+            Visible = false,
+        })
+        local healthFill = TrackDrawing("Square", {
+            Size = Vector2.new(2, 2),
+            Color = Color3.fromRGB(0, 255, 30),
+            Filled = true,
+            Transparency = 1,
+            ZIndex = 1,
+            Visible = false,
+        })
+        local arrowLines = table.create(2)
+        for i = 1, 2 do
+            arrowLines[i] = TrackDrawing("Line", {
+                Thickness = 2,
+                Color = Config.ColorHidden,
+                Transparency = startAlpha,
+                ZIndex = 0,
+                Visible = false,
+            })
+        end
+
+        local rayParams = RaycastParams.new()
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        rayParams.IgnoreWater = true
+        rayParams.RespectCanCollide = false
+
+        return {
+            Player = player,
+            Box = box,
+            Head = head,
+            Text = text,
+            SkeletonLines = skeletonLines,
+            CornerLines = cornerLines,
+            HealthOutline = healthOutline,
+            HealthFill = healthFill,
+            ArrowLines = arrowLines,
+
+            -- Reactive Character State
+            Character = nil,
+            Humanoid = nil,
+            RootPart = nil,
+            HeadPart = nil,
+            Alive = false,
+
+            -- Integer-Indexed Rig State
+            RigType = nil,
+            NameMap = nil,
+            Bones = nil,
+            BoneCount = 0,
+            PartCount = 0,
+            LowestIndices = nil,
+            PartArray = table.create(15),
+            JointScreen = table.create(15),
+
+            -- Raycast & Style State
+            FilterTable = table.create(8),
+            RayParams = rayParams,
+            RayPhaseOffset = rayPhaseOffset,
+            LastRayTime = os.clock() - (rayPhaseOffset * Config.RaycastInterval),
+            CachedVisible = false,
+            LastColor = nil,
+            LastAlpha = nil,
+            StyleVersion = StyleVersion,
+            LastDistanceInt = -1,
+            LastHp = -1,
+            ArrowColor = nil,
+            ArrowAlpha = nil,
+
+            -- Shadowed Drawing Visibility Flags
+            Hidden = true,
+            BoxShown = false,
+            CornerShown = false,
+            HeadShown = false,
+            TextShown = false,
+            SkelShown = false,
+            HealthShown = false,
+            ArrowShown = false,
+            LineShown = lineShown,
+
+            Bound = false,
+            Destroyed = false,
+            CharConnections = {},
+        }
+    end)
+
+    if not ok or not data then
+        Health.AllocFailures += 1
+        for _, obj in ipairs(allocated) do
+            SafeRemoveDrawing(obj)
+        end
+        return
+    end
+
+    ESPCache[player] = data
+    Metrics.TrackedPlayers += 1
+
+    local function ClearCharacterState()
+        SafeDisconnect(data.CharConnections.Died)
+        SafeDisconnect(data.CharConnections.HealthChanged)
+        SafeDisconnect(data.CharConnections.ChildAdded)
+        SafeDisconnect(data.CharConnections.ChildRemoved)
+        data.CharConnections.Died = nil
+        data.CharConnections.HealthChanged = nil
+        data.CharConnections.ChildAdded = nil
+        data.CharConnections.ChildRemoved = nil
+
+        data.Character = nil
+        data.Humanoid = nil
+        data.RootPart = nil
+        data.HeadPart = nil
+        data.Alive = false
+        data.RigType = nil
+        data.NameMap = nil
+        data.Bones = nil
+        data.BoneCount = 0
+        data.PartCount = 0
+        data.LowestIndices = nil
+
+        table.clear(data.PartArray)
+        table.clear(data.JointScreen)
+        data.CachedVisible = false
+        HideESPData(data)
+    end
+
+    local function BindHumanoid(hum)
+        if data.Humanoid == hum then return end
+        SafeDisconnect(data.CharConnections.Died)
+        SafeDisconnect(data.CharConnections.HealthChanged)
+
+        data.Humanoid = hum
+        data.Alive = hum.Health > 0
+
+        if not data.RigType then
+            if hum.RigType == Enum.HumanoidRigType.R15 then
+                ApplyRigProfile(data, "R15")
+            elseif hum.RigType == Enum.HumanoidRigType.R6 then
+                ApplyRigProfile(data, "R6")
+            end
+        end
+
+        data.CharConnections.Died = hum.Died:Connect(function()
+            data.Alive = false
+            HideESPData(data)
+        end)
+
+        data.CharConnections.HealthChanged = hum.HealthChanged:Connect(function(hp)
+            local aliveNow = hp > 0
+            data.Alive = aliveNow
+            if not aliveNow then
+                HideESPData(data)
+            end
+        end)
+    end
+
+    local function InspectChildAdded(child)
+        if data.Destroyed then return end
+        if child:IsA("BasePart") then
+            local name = child.Name
+            if name == "HumanoidRootPart" then
+                data.RootPart = child
+            elseif name == "Head" then
+                data.HeadPart = child
+            end
+
+            if not data.RigType then
+                if name == "UpperTorso" or name == "LowerTorso" then
+                    ApplyRigProfile(data, "R15")
+                elseif name == "Torso" then
+                    ApplyRigProfile(data, "R6")
+                end
+            end
+
+            local nameMap = data.NameMap
+            if nameMap then
+                local idx = nameMap[name]
+                if idx then
+                    data.PartArray[idx] = child
+                end
+            end
+        elseif child:IsA("Humanoid") then
+            BindHumanoid(child)
+        end
+    end
+
+    local function InspectChildRemoved(child)
+        if data.Destroyed then return end
+        if child == data.RootPart then
+            data.RootPart = nil
+        elseif child == data.HeadPart then
+            data.HeadPart = nil
+        elseif child == data.Humanoid then
+            SafeDisconnect(data.CharConnections.Died)
+            SafeDisconnect(data.CharConnections.HealthChanged)
+            data.CharConnections.Died = nil
+            data.CharConnections.HealthChanged = nil
+            data.Humanoid = nil
+            data.Alive = false
+        end
+
+        local nameMap = data.NameMap
+        if nameMap and child:IsA("BasePart") then
+            local idx = nameMap[child.Name]
+            if idx and data.PartArray[idx] == child then
+                data.PartArray[idx] = nil
+            end
+        end
+    end
+
+    local function OnCharacterAdded(character)
+        if not character or IsUnloaded or data.Destroyed then return end
+        ClearCharacterState()
+
+        data.Character = character
+
+        -- Immediate synchronous pass over already-present instances
+        for _, child in ipairs(character:GetChildren()) do
+            InspectChildAdded(child)
+        end
+
+        -- Reactive listeners handle late-streamed parts & StreamingEnabled seamlessly
+        data.CharConnections.ChildAdded = character.ChildAdded:Connect(InspectChildAdded)
+        data.CharConnections.ChildRemoved = character.ChildRemoved:Connect(InspectChildRemoved)
+    end
+
+    data.Bind = function()
+        if data.Bound or data.Destroyed or IsUnloaded then return end
+        data.Bound = true
+        data.CharConnections.Added = player.CharacterAdded:Connect(OnCharacterAdded)
+        data.CharConnections.Removing = player.CharacterRemoving:Connect(ClearCharacterState)
+        if player.Character then
+            OnCharacterAdded(player.Character)
+        end
+    end
+
+    data.Bind()
+end
+
+local function RemoveESPObject(player)
+    local data = ESPCache[player]
+    if not data then return end
+
+    data.Destroyed = true
+
+    for _, conn in pairs(data.CharConnections) do
+        SafeDisconnect(conn)
+    end
+    table.clear(data.CharConnections)
+
+    SafeRemoveDrawing(data.Box)
+    SafeRemoveDrawing(data.Head)
+    SafeRemoveDrawing(data.Text)
+    SafeRemoveDrawing(data.HealthOutline)
+    SafeRemoveDrawing(data.HealthFill)
+
+    for i = 1, 14 do
+        SafeRemoveDrawing(data.SkeletonLines[i])
+    end
+    for i = 1, 8 do
+        SafeRemoveDrawing(data.CornerLines[i])
+    end
+    for i = 1, 2 do
+        SafeRemoveDrawing(data.ArrowLines[i])
+    end
+
+    table.clear(data.PartArray)
+    table.clear(data.JointScreen)
+    table.clear(data.FilterTable)
+
+    ESPCache[player] = nil
+    Metrics.TrackedPlayers = math.max(0, Metrics.TrackedPlayers - 1)
+end
+
+--==============================================================================
+-- 17. Main RenderStepped Loop (Zero-Closure, State-Shadowed, Native-Optimized)
+--==============================================================================
+local function UpdateESP()
+    if IsUnloaded then return end
+    local espStartClock = os.clock()
+    Metrics.FrameRays = 0
+
+    local cam = Workspace.CurrentCamera
+    if cam ~= WorldState.Camera then
+        BindCamera(cam)
+    end
+    if not cam then
+        HideAllESP()
+        if Combat then
+            pcall(Combat.Update, Combat, espStartClock, 0, 0, nil, math.huge, false, 0, 0)
+        end
+        return
+    end
+
+    local viewportPoint = cam.WorldToViewportPoint
+    local viewportSize = WorldState.ViewportSize
+    local screenW, screenH = viewportSize.X, viewportSize.Y
+    local cameraCFrame = cam.CFrame
+    local cameraPos = cameraCFrame.Position
+    local cameraUp = cameraCFrame.UpVector
+    local cameraRight = cameraCFrame.RightVector
+
+    local localChar = WorldState.LocalChar
+    local localRoot = WorldState.LocalRoot
+    local originPos = (localRoot and localRoot.Position) or cameraPos
+    local localTeam = LocalPlayer.Team
+
+    local maxDist = Config.MaxDistance
+    local maxDistSq = maxDist * maxDist
+
+    local showBox = Config.ShowBox
+    local useCorner = showBox and Config.CornerBox
+    local useFullBox = showBox and not Config.CornerBox
+    local showHead = Config.ShowHead
+    local showDist = Config.ShowDistance
+    local showSkel = Config.ShowSkeleton
+    local visCheck = Config.VisibilityCheck
+    local teamCheck = Config.TeamCheck
+    local showHealth = Config.HealthBar
+    local showArrows = Config.OffscreenArrows
+
+    local colorVisible, colorHidden = Config.ColorVisible, Config.ColorHidden
+    local alphaVisible, alphaHidden = Config.ColorVisibleAlpha, Config.ColorHiddenAlpha
+    local styleVer = StyleVersion
+
+    -- Off-screen arrow geometry (kept inside the screen even on small viewports)
+    local centerX, centerY = screenW * 0.5, screenH * 0.5
+    local arrowRadius = math.min(Config.ArrowRadius, math.max(40, math.min(screenW, screenH) * 0.5 - 24))
+    local arrowSize = Config.ArrowSize
+
+    -- Threat telemetry (feeds the Combat module)
+    local threatCount, visibleCount = 0, 0
+    local nearestData, nearestDistSq, nearestOn, nearestX, nearestY = nil, math.huge, false, 0, 0
+
+    local activeCount = 0
+
+    for player, data in pairs(ESPCache) do
+        if teamCheck and localTeam ~= nil and player.Team == localTeam then
+            HideESPData(data)
+            continue
+        end
+
+        local character = data.Character
+        if not character or not character.Parent or not data.Alive then
+            HideESPData(data)
+            continue
+        end
+
+        local rootPart = data.RootPart
+        local headPart = data.HeadPart
+        if not rootPart or not headPart then
+            HideESPData(data)
+            continue
+        end
+
+        local rootPos = rootPart.Position
+        local delta = rootPos - originPos
+        local distSq = delta:Dot(delta)
+        if distSq > maxDistSq then
+            HideESPData(data)
+            continue
+        end
+
+        local rootScreen, rootOnScreen = viewportPoint(cam, rootPos)
+
+        -- Threat telemetry (every valid enemy in range counts, on-screen or not)
+        threatCount += 1
+        if distSq < nearestDistSq then
+            nearestDistSq = distSq
+            nearestData = data
+            nearestOn = rootOnScreen
+            nearestX, nearestY = rootScreen.X, rootScreen.Y
+        end
+
+        -- Off-screen arrow (passive pointer toward enemies outside the view)
+        if showArrows and not rootOnScreen then
+            local rel = cameraCFrame:PointToObjectSpace(rootPos)
+            local ax, ay = rel.X, -rel.Y
+            local mag = math.sqrt(ax * ax + ay * ay)
+            if mag < 1e-3 then
+                ax, ay, mag = 0, 1, 1
+            end
+            PlaceArrow(data, centerX, centerY, ax / mag, ay / mag, arrowRadius, arrowSize, colorHidden, alphaHidden)
+        elseif data.ArrowShown then
+            HideArrow(data)
+        end
+
+        if rootScreen.Z <= 0 then
+            HideESPBody(data)
+            continue
+        end
+
+        if not rootOnScreen then
+            if rootScreen.X < -OFFSCREEN_MARGIN or rootScreen.X > (screenW + OFFSCREEN_MARGIN)
+                or rootScreen.Y < -OFFSCREEN_MARGIN or rootScreen.Y > (screenH + OFFSCREEN_MARGIN) then
+                HideESPBody(data)
+                continue
+            end
+        end
+
+        local headPos = headPart.Position
+
+        -- 0. Live style propagation (thickness / text size)
+        if data.StyleVersion ~= styleVer then
+            ApplyStyle(data)
+        end
+
+        -- 1. Visibility & Styling (Only updates Drawing properties on state change)
+        local isVisible = false
+        if visCheck then
+            isVisible = CheckCharacterVisibility(data, espStartClock, cameraPos, headPos, rootPos, character, localChar)
+        else
+            data.CachedVisible = false
+        end
+        if isVisible then
+            visibleCount += 1
+        end
+
+        local activeColor = isVisible and colorVisible or colorHidden
+        local activeAlpha = isVisible and alphaVisible or alphaHidden
+
+        if data.LastColor ~= activeColor or data.LastAlpha ~= activeAlpha then
+            data.LastColor = activeColor
+            data.LastAlpha = activeAlpha
+
+            data.Box.Color = activeColor
+            data.Box.Transparency = activeAlpha
+            data.Head.Color = activeColor
+            data.Head.Transparency = activeAlpha
+            data.Text.Color = activeColor
+            data.Text.Transparency = activeAlpha
+
+            local skelLines = data.SkeletonLines
+            for i = 1, 14 do
+                skelLines[i].Color = activeColor
+                skelLines[i].Transparency = activeAlpha
+            end
+
+            local cornerLines = data.CornerLines
+            for i = 1, 8 do
+                cornerLines[i].Color = activeColor
+                cornerLines[i].Transparency = activeAlpha
+            end
+        end
+
+        -- 2. Perspective-Accurate Bounding Box Calculation
+        local needBounds = showBox or showDist or showHealth
+        local boxX, boxY, boxW, boxH = 0, 0, 0, 0
+        local validBounds = false
+
+        if needBounds then
+            local topWorld = headPos + Vector3.new(0, headPart.Size.Y * 0.5 + 0.35, 0)
+
+            local lowestY = rootPos.Y - 2.75
+            local lowestIndices = data.LowestIndices
+            local partArray = data.PartArray
+            if lowestIndices then
+                local foundFoot = false
+                local minFootY = math.huge
+                for i = 1, #lowestIndices do
+                    local p = partArray[lowestIndices[i]]
+                    if p then
+                        local bottomY = p.Position.Y - (p.Size.Y * 0.5)
+                        if bottomY < minFootY then
+                            minFootY = bottomY
+                            foundFoot = true
+                        end
+                    end
+                end
+                if foundFoot then
+                    lowestY = minFootY - 0.1
+                end
+            end
+
+            local bottomWorld = Vector3.new(rootPos.X, lowestY, rootPos.Z)
+            local topScreen = viewportPoint(cam, topWorld)
+            local bottomScreen = viewportPoint(cam, bottomWorld)
+
+            if topScreen.Z > 0 and bottomScreen.Z > 0 then
+                local minY = math.min(topScreen.Y, bottomScreen.Y)
+                local maxY = math.max(topScreen.Y, bottomScreen.Y)
+                boxH = maxY - minY
+
+                -- True perspective shoulder width so steep camera pitch never crushes box width
+                local sideScreen = viewportPoint(cam, rootPos + cameraRight * 1.65)
+                local perspW = math.abs(sideScreen.X - rootScreen.X) * 2
+
+                boxH = math.max(boxH, perspW * 0.65)
+                if boxH >= 4 then
+                    boxW = math.max(boxH * 0.56, perspW)
+                    boxX = math.floor(rootScreen.X - (boxW * 0.5))
+                    boxY = math.floor(minY)
+                    boxW = math.floor(boxW)
+                    boxH = math.floor(boxH)
+                    validBounds = true
+                end
+            end
+        end
+
+        -- 3. 2D Full Box vs Corner Box (State-Shadowed)
+        if validBounds and useFullBox then
+            if data.CornerShown then
+                HideCornerLines(data)
+            end
+            data.Box.Size = Vector2.new(boxW, boxH)
+            data.Box.Position = Vector2.new(boxX, boxY)
+            if not data.BoxShown then
+                data.Box.Visible = true
+                data.BoxShown = true
+            end
+        elseif validBounds and useCorner then
+            if data.BoxShown then
+                data.Box.Visible = false
+                data.BoxShown = false
+            end
+
+            local cw = math.max(3, math.floor(boxW * CORNER_FRACTION))
+            local ch = math.max(3, math.floor(boxH * CORNER_FRACTION))
+            local x1, y1 = boxX, boxY
+            local x2, y2 = boxX + boxW, boxY + boxH
+            local cLines = data.CornerLines
+
+            cLines[1].From = Vector2.new(x1, y1)
+            cLines[1].To   = Vector2.new(x1 + cw, y1)
+            cLines[2].From = Vector2.new(x1, y1)
+            cLines[2].To   = Vector2.new(x1, y1 + ch)
+
+            cLines[3].From = Vector2.new(x2, y1)
+            cLines[3].To   = Vector2.new(x2 - cw, y1)
+            cLines[4].From = Vector2.new(x2, y1)
+            cLines[4].To   = Vector2.new(x2, y1 + ch)
+
+            cLines[5].From = Vector2.new(x1, y2)
+            cLines[5].To   = Vector2.new(x1 + cw, y2)
+            cLines[6].From = Vector2.new(x1, y2)
+            cLines[6].To   = Vector2.new(x1, y2 - ch)
+
+            cLines[7].From = Vector2.new(x2, y2)
+            cLines[7].To   = Vector2.new(x2 - cw, y2)
+            cLines[8].From = Vector2.new(x2, y2)
+            cLines[8].To   = Vector2.new(x2, y2 - ch)
+
+            if not data.CornerShown then
+                for i = 1, 8 do
+                    cLines[i].Visible = true
+                end
+                data.CornerShown = true
+            end
+        else
+            if data.BoxShown then
+                data.Box.Visible = false
+                data.BoxShown = false
+            end
+            if data.CornerShown then
+                HideCornerLines(data)
+            end
+        end
+
+        -- 3b. Health Bar (left of the box, read-only Humanoid.Health)
+        if validBounds and showHealth then
+            local ratio = 1
+            local hum = data.Humanoid
+            if hum then
+                local maxHp = hum.MaxHealth
+                if maxHp > 0 then
+                    ratio = hum.Health / maxHp
+                end
+            end
+            if ratio ~= ratio then ratio = 0 end
+            ratio = math.clamp(ratio, 0, 1)
+
+            local fillH = math.max(math.floor(boxH * ratio + 0.5), 1)
+            data.HealthOutline.Size = Vector2.new(4, boxH + 2)
+            data.HealthOutline.Position = Vector2.new(boxX - 6, boxY - 1)
+            data.HealthFill.Size = Vector2.new(2, fillH)
+            data.HealthFill.Position = Vector2.new(boxX - 5, boxY + boxH - fillH)
+
+            local hpInt = math.floor(ratio * 100 + 0.5)
+            if data.LastHp ~= hpInt then
+                data.LastHp = hpInt
+                data.HealthFill.Color = Color3.fromRGB(
+                    math.floor(255 * math.min(1, 2 * (1 - ratio))),
+                    math.floor(255 * math.min(1, 2 * ratio)),
+                    30
+                )
+            end
+            if not data.HealthShown then
+                data.HealthOutline.Visible = true
+                data.HealthFill.Visible = true
+                data.HealthShown = true
+            end
+        elseif data.HealthShown then
+            HideHealth(data)
+        end
+
+        -- 4. Distance Text (State-Shadowed)
+        if validBounds and showDist then
+            local distInt = math.floor(math.sqrt(distSq) + 0.5)
+            if data.LastDistanceInt ~= distInt then
+                data.LastDistanceInt = distInt
+                data.Text.Text = string.format("%dm", distInt)
+            end
+            data.Text.Position = Vector2.new(boxX + math.floor(boxW * 0.5), boxY - (Config.TextSize + 4))
+            if not data.TextShown then
+                data.Text.Visible = true
+                data.TextShown = true
+            end
+        elseif data.TextShown then
+            data.Text.Visible = false
+            data.TextShown = false
+        end
+
+        -- 5. Head ESP + Joint #1 Projection Cache
+        local headVec2 = nil
+        if showHead or (showSkel and data.BoneCount > 0) then
+            local hScreen = viewportPoint(cam, headPos)
+            if hScreen.Z > 0 then
+                headVec2 = Vector2.new(hScreen.X, hScreen.Y)
+            end
+        end
+
+        if showHead and headVec2 then
+            local edgeWorld = headPos + (cameraUp * (headPart.Size.Y * 0.5 * Config.HeadPadding))
+            local edgeScreen = viewportPoint(cam, edgeWorld)
+            local dx = headVec2.X - edgeScreen.X
+            local dy = headVec2.Y - edgeScreen.Y
+            local radius = math.sqrt(dx * dx + dy * dy)
+
+            data.Head.Position = headVec2
+            data.Head.Radius = math.clamp(radius, 2, 200)
+            if not data.HeadShown then
+                data.Head.Visible = true
+                data.HeadShown = true
+            end
+        elseif data.HeadShown then
+            data.Head.Visible = false
+            data.HeadShown = false
+        end
+
+        -- 6. Integer-Indexed Skeleton ESP (Deduplicated Joint Projection + State Shadowing)
+        local boneCount = data.BoneCount
+        if showSkel and boneCount > 0 then
+            local partArray = data.PartArray
+            local jointScreen = data.JointScreen
+            local partCount = data.PartCount
+
+            jointScreen[1] = headVec2
+            for i = 2, partCount do
+                local part = partArray[i]
+                if part then
+                    local pos = viewportPoint(cam, part.Position)
+                    if pos.Z > 0 then
+                        jointScreen[i] = Vector2.new(pos.X, pos.Y)
+                    else
+                        jointScreen[i] = nil
+                    end
+                else
+                    jointScreen[i] = nil
+                end
+            end
+
+            local bones = data.Bones
+            local skelLines = data.SkeletonLines
+            local lineShown = data.LineShown
+
+            for i = 1, boneCount do
+                local pair = bones[i]
+                local pA = jointScreen[pair[1]]
+                local pB = jointScreen[pair[2]]
+                local line = skelLines[i]
+
+                if pA and pB then
+                    line.From = pA
+                    line.To = pB
+                    if not lineShown[i] then
+                        line.Visible = true
+                        lineShown[i] = true
+                    end
+                elseif lineShown[i] then
+                    line.Visible = false
+                    lineShown[i] = false
+                end
+            end
+
+            data.SkelShown = true
+        elseif data.SkelShown then
+            HideSkeletonLines(data, 1)
+        end
+
+        data.Hidden = false
+        activeCount += 1
+    end
+
+    -- 7. Combat module (isolated: a failure here never breaks the ESP frame)
+    if Combat then
+        pcall(Combat.Update, Combat, espStartClock, threatCount, visibleCount,
+            nearestData, nearestDistSq, nearestOn, nearestX, nearestY)
+    end
+
+    -- 8. Performance Telemetry Sampling
+    local now = os.clock()
+    local espElapsedMs = (now - espStartClock) * 1000
+    Metrics.FrameCount += 1
+    Metrics.ESPSumMs += espElapsedMs
+    if espElapsedMs > Metrics.ESPMaxSample then
+        Metrics.ESPMaxSample = espElapsedMs
+    end
+    Metrics.ActiveESPCount = activeCount
+
+    local sampleElapsed = now - Metrics.LastSampleTime
+    if sampleElapsed >= 0.5 then
+        local frames = math.max(1, Metrics.FrameCount)
+        Metrics.FPS = math.floor((Metrics.FrameCount / sampleElapsed) + 0.5)
+        Metrics.FrameTimeMs = (sampleElapsed / frames) * 1000
+        Metrics.ESPAvgMs = Metrics.ESPSumMs / frames
+        Metrics.ESPMaxMs = Metrics.ESPMaxSample
+        Metrics.RaysPerSec = math.floor((Metrics.RayCount / sampleElapsed) + 0.5)
+
+        Metrics.FrameCount = 0
+        Metrics.RayCount = 0
+        Metrics.ESPSumMs = 0
+        Metrics.ESPMaxSample = 0
+        Metrics.LastSampleTime = now
+
+        if Stats and Stats.Visible then
+            Stats:UpdateText()
+        end
+    end
+end
+
+-- Fault-tolerant frame wrapper: one bad frame (destroyed instance, executor hiccup, ...)
+-- can never kill the loop. After repeated failures the ESP pauses for 2s, then self-heals.
+-- The menu clock / Security tab keep running even while the ESP is paused.
+local LoopErrors = 0
+local function SafeFrame()
+    if IsUnloaded then return end
+
+    local now = os.clock()
+    if now >= Health.PausedUntil then
+        local ok, err = pcall(UpdateESP)
+        if ok then
+            LoopErrors = 0
+        else
+            LoopErrors += 1
+            Health.LoopErrorsTotal += 1
+            if LoopErrors == 1 or LoopErrors % 60 == 0 then
+                warn("[0x] Render loop error: " .. tostring(err))
+            end
+            if LoopErrors >= 30 then
+                pcall(HideAllESP)
+                Health.PausedUntil = now + 2
+                Health.LoopPauses += 1
+                LoopErrors = 0
+            end
+        end
+    end
+
+    -- Header clock (cheap: string work only once per second, and only while the menu is open)
+    pcall(UI.TickClock, UI)
+    -- Security tab live data (re-scan once per second, only while that tab is on screen)
+    pcall(Security.Tick, Security, now)
+end
+
+--==============================================================================
+-- 18. Unload & Complete Resource Teardown
+--==============================================================================
+local function Unload()
+    if IsUnloaded then return end
+
+    if Config.AutoSave then
+        pcall(ConfigIO.Save) -- before teardown so the menu position is still valid
+    end
+    IsUnloaded = true
+
+    -- Every stage is isolated: one failing step must never leave the rest leaking
+    pcall(SafeDisconnect, WorldState.CameraConn)
+    WorldState.CameraConn = nil
+    for _, conn in pairs(WorldState.LocalCharConns) do
+        pcall(SafeDisconnect, conn)
+    end
+    table.clear(WorldState.LocalCharConns)
+
+    for _, conn in pairs(GlobalConnections) do
+        pcall(SafeDisconnect, conn)
+    end
+    table.clear(GlobalConnections)
+
+    for player in pairs(ESPCache) do
+        pcall(RemoveESPObject, player)
+    end
+    table.clear(ESPCache)
+
+    if Crosshair then pcall(Crosshair.Destroy, Crosshair) end
+    if Combat then pcall(Combat.Destroy, Combat) end
+    if UI then pcall(UI.Destroy, UI) end
+    if Stats then pcall(Stats.Destroy, Stats) end
+
+    if GlobalEnv.__0x_Unload == Unload then
+        GlobalEnv.__0x_Unload = nil
+    end
+    if GlobalEnv.__EnemyESP_Unload == Unload then
+        GlobalEnv.__EnemyESP_Unload = nil
+    end
+    if GlobalEnv.__0x_Token == Health.Token then
+        GlobalEnv.__0x_Token = nil
+    end
+
+    local displayName = LocalPlayer.DisplayName or LocalPlayer.Name
+    local goodbyeText = string.format("0x  |  GOODBYE, %s", string.upper(displayName))
+    print(string.format("[0x] v%s (%s) Unloaded cleanly. Goodbye, %s!", VERSION, BUILD, displayName))
+    ShowBanner(goodbyeText, Color3.fromRGB(255, 80, 80), 2.5)
+end
+
+Health.Unload = Unload
+GlobalEnv.__0x_Unload = Unload
+GlobalEnv.__EnemyESP_Unload = Unload
+GlobalEnv.__0x_Token = Health.Token
+
+--==============================================================================
+-- 19. Initialization & Event Wiring
+--==============================================================================
+BindCamera(Workspace.CurrentCamera)
+BindLocalCharacter(LocalPlayer.Character)
+
+GlobalConnections.CameraChanged = Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    BindCamera(Workspace.CurrentCamera)
+end)
+GlobalConnections.LocalCharAdded = LocalPlayer.CharacterAdded:Connect(BindLocalCharacter)
+GlobalConnections.LocalCharRemoving = LocalPlayer.CharacterRemoving:Connect(function()
+    BindLocalCharacter(nil)
+end)
+
+Crosshair:Init()
+Stats:Init()
+Combat:Init()
+UI:Init()
+
+ConfigIO.LoadSlotMeta()
+local loadedOk, loadMsg = ConfigIO.Load(true)
+if loadedOk then
+    UI:SetStatus(loadMsg)
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= LocalPlayer then
+        CreateESPObject(player)
+    end
+end
+
+GlobalConnections.PlayerAdded = Players.PlayerAdded:Connect(Guard("PlayerAdded", CreateESPObject))
+GlobalConnections.PlayerRemoving = Players.PlayerRemoving:Connect(Guard("PlayerRemoving", RemoveESPObject))
+GlobalConnections.RenderStepped = RunService.RenderStepped:Connect(SafeFrame)
+
+GlobalConnections.InputBegan = UserInputService.InputBegan:Connect(Guard("InputBegan", function(input)
+    if IsUnloaded then return end
+
+    if UserInputService:GetFocusedTextBox() == nil then
+        if input.KeyCode == Config.UnloadKey then
+            Unload()
+            return
+        elseif input.KeyCode == Config.MenuToggleKey then
+            UI:SetVisible(not UI.Visible)
+            return
+        end
+    end
+
+    if UI.Visible and input.UserInputType == Enum.UserInputType.MouseButton1 then
+        UI:OnMouseDown(UserInputService:GetMouseLocation())
+    end
+end))
+
+GlobalConnections.InputChanged = UserInputService.InputChanged:Connect(Guard("InputChanged", function(input)
+    if IsUnloaded or not UI.Visible then return end
+    local inputType = input.UserInputType
+    if inputType == Enum.UserInputType.MouseMovement then
+        if UI.Dragging or UI.ActiveSlider then
+            UI:OnMouseMove(UserInputService:GetMouseLocation())
+        end
+    elseif inputType == Enum.UserInputType.MouseWheel then
+        local z = input.Position.Z
+        if z ~= 0 then
+            UI:OnWheel(UserInputService:GetMouseLocation(), z)
+        end
+    end
+end))
+
+GlobalConnections.InputEnded = UserInputService.InputEnded:Connect(Guard("InputEnded", function(input)
+    if IsUnloaded then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        UI:OnMouseUp()
+    end
+end))
+
+GlobalConnections.WindowFocusReleased = UserInputService.WindowFocusReleased:Connect(Guard("FocusReleased", function()
+    if IsUnloaded then return end
+    UI:OnMouseUp()
+end))
+
+local displayName = LocalPlayer.DisplayName or LocalPlayer.Name
+local welcomeText = string.format("0x  |  WELCOME, %s", string.upper(displayName))
+print(string.format("[0x] v%s (%s) Loaded! Welcome, %s. [%s] Menu | [%s] Unload", VERSION, BUILD, displayName,
+    KeyLabel(Config.MenuToggleKey), KeyLabel(Config.UnloadKey)))
+ShowBanner(welcomeText, Color3.fromRGB(0, 255, 0), 3.5)
+
+--==============================================================================
+-- 20. Public API Table (Ox)
+--==============================================================================
+local function ToggleKey(configKey, after)
+    return function(state)
+        Config[configKey] = Resolve(state, Config[configKey])
+        if after then after() end
+        UI:Refresh()
+        ConfigIO.NotifyChanged()
+        return Config[configKey]
+    end
+end
+
+-- Read-only view of the live config. Writes are routed through the validated setter,
+-- so external scripts can never push an out-of-range / wrong-type value into the engine.
+local ConfigProxy = setmetatable({}, {
+    __index = Config,
+    __newindex = function(_, key, value)
+        local ok, msg = ConfigIO.Set(key, value)
+        if not ok then
+            warn(string.format("[0x] Rejected Config.%s: %s", tostring(key), tostring(msg)))
+        end
+    end,
+    __iter = function()
+        return next, Config
+    end,
+    __metatable = "locked",
+})
+Health.ConfigProxy = ConfigProxy
+
+local Ox = {
+    Version = VERSION,
+    Build = BUILD,
+    Config = ConfigProxy,
+    Unload = Unload,
+    UI = UI,
+    Stats = Stats,
+    Crosshair = Crosshair,
+    Combat = Combat,
+
+    -- Config system
+    SaveConfig = ConfigIO.Save,
+    LoadConfig = function() return ConfigIO.Load(false) end,
+    ResetConfig = ConfigIO.Reset,
+    SetSlot = ConfigIO.SetSlot,
+    Set = ConfigIO.Set, -- validated: Ox.Set("ColorVisibleAlpha", 0.6)
+    Get = function(key) return Config[key] end,
+    SetKeybind = function(which, keyCode)
+        return ConfigIO.Set(which == "menu" and "MenuToggleKey" or "UnloadKey", keyCode)
+    end,
+    SetOwnerLabel = function(text) UI:SetOwnerLabel(text) end,
+
+    SetMaxDistance = function(dist)
+        return ConfigIO.Set("MaxDistance", dist)
+    end,
+
+    -- Security monitor: Ox.Security.Scan() -> { Security, Reliability, Overall, Verdict, Advice }
+    Security = {
+        Scan = function()
+            Security:Scan()
+            return {
+                Security = Security.SecurityPct,
+                Reliability = Security.ReliabilityPct,
+                Overall = Security.OverallPct,
+                Verdict = Security.Verdict,
+                Advice = Security.Advice,
+            }
+        end,
+    },
+
+    Toggle = {
+        Box = ToggleKey("ShowBox"),
+        Corner = function(state)
+            Config.CornerBox = Resolve(state, Config.CornerBox)
+            if Config.CornerBox then Config.ShowBox = true end
+            UI:Refresh()
+            ConfigIO.NotifyChanged()
+            return Config.CornerBox
+        end,
+        Skeleton = ToggleKey("ShowSkeleton"),
+        Head = ToggleKey("ShowHead"),
+        Distance = ToggleKey("ShowDistance"),
+        WallCheck = ToggleKey("VisibilityCheck"),
+        TeamCheck = ToggleKey("TeamCheck"),
+        Crosshair = ToggleKey("ShowCrosshair", function() Crosshair:MarkDirty() end),
+        Dot = ToggleKey("CrosshairDot", function() Crosshair:MarkDirty() end),
+        Stats = ToggleKey("ShowStats", function() Stats:SetVisible(Config.ShowStats) end),
+        HealthBar = ToggleKey("HealthBar"),
+        Arrows = ToggleKey("OffscreenArrows"),
+        ThreatHUD = ToggleKey("ThreatHUD"),
+        ThreatLine = ToggleKey("ThreatLine"),
+    },
+}
+
+-- First audit once everything (API included) exists
+Security:Scan()
+UI:Refresh()
+
+return Ox
