@@ -2,25 +2,7 @@
 --!optimize 2
 
 --[[
-    0x — High-Performance Enemy ESP, Combat Awareness, Security Monitor & Pixel UI Suite (v11.6 | build 110326a)
-
-    v11.6 changelog:
-    + NEW  HITMARKER: a hit marker pops at the screen center whenever you strike an enemy and deal
-           damage (detected passively via the enemy Humanoid's HealthChanged; when the game tags the
-           attacker with a "creator" ObjectValue, only YOUR strikes trigger it). Customizable:
-           color + alpha (COLORS tab "HIT" target), shape (X / + / DIAMOND / CIRCLE), lifetime
-           (0.2-3.0 s fade), size, and on/off toggle. Fixed object pool - zero per-hit allocations.
-    + UPGRADED HEALTH BARS: smooth damage-drain animation with a fading "recently lost HP" trail,
-           proper green->yellow->red gradient, configurable bar width (3-10 px), NaN-safe ratio,
-           auto-hide while no Humanoid is bound.
-    + FIX  Off-screen arrows for enemies BEHIND the camera pointed the wrong way (mirrored):
-           the projected direction is now flipped when the target is behind the view plane.
-    + Stability: every per-player character handler (added / removing / child +/- / health / died)
-                 is pcall-guarded with rate-limited warnings, matching the global input handlers.
-    + UI: sliders now support fractional values (decimals) - hitmarker lifetime shows "x.xs".
-    + Config: 7 new keys (Hitmarker, HitmarkerColor, HitmarkerAlpha, HitmarkerShape,
-              HitmarkerDuration, HitmarkerSize, HealthBarWidth). Old v10.x / v11.x configs load
-              unchanged (missing keys fall back to defaults).
+    0x — High-Performance Enemy ESP, Combat Awareness, Security Monitor & Pixel UI Suite (v11.5 | build 051126a)
 
     v11.5 changelog:
     + NEW  SECURITY tab: live Security % and Reliability % computed from 11 self-checks
@@ -106,8 +88,8 @@ local isfile = type(isfile) == "function" and isfile or nil
 --==============================================================================
 -- 3. Configuration & Defaults
 --==============================================================================
-local VERSION = "11.6"
-local BUILD = "110326a"
+local VERSION = "11.5"
+local BUILD = "051126a"
 local OWNER_LABEL = "OWNER" -- text of the header badge (max 10 chars, change freely)
 
 local DefaultConfig = {
@@ -152,20 +134,11 @@ local DefaultConfig = {
 
     -- Combat awareness (passive / read-only, drawing only)
     HealthBar = true,
-    HealthBarWidth = 4,
     OffscreenArrows = true,
     ArrowRadius = 180,
     ArrowSize = 10,
     ThreatHUD = true,
     ThreatLine = false,
-
-    -- Hitmarker (shown at the screen center when you damage an enemy)
-    Hitmarker = true,
-    HitmarkerColor = Color3.fromRGB(255, 255, 255),
-    HitmarkerAlpha = 1,
-    HitmarkerShape = 1,      -- 1 = X, 2 = +, 3 = DIAMOND, 4 = CIRCLE
-    HitmarkerDuration = 0.6, -- seconds (fade-out lifetime)
-    HitmarkerSize = 10,      -- px
 
     -- Raycast Tuning
     WallPenetrationLimit = 4,
@@ -203,7 +176,6 @@ local FeatureRegistry = {
     { Key = "OffscreenArrows", Name = "ARROWS",       Passive = true },
     { Key = "ThreatHUD",       Name = "THREAT HUD",   Passive = true },
     { Key = "ThreatLine",      Name = "THREAT LINE",  Passive = true },
-    { Key = "Hitmarker",       Name = "HITMARKER",    Passive = true }, -- reads health deltas, draws
     { Key = "ShowStats",       Name = "DEBUG",        Passive = true },
 }
 
@@ -213,7 +185,7 @@ local FeatureRegistry = {
 local OFFSCREEN_MARGIN = 250
 local HEAD_NUM_SIDES = 24
 local CORNER_FRACTION = 0.25
-local DRAWINGS_PER_PLAYER = 30 -- 1 Box + 1 Head + 1 Text + 14 Skeleton + 8 Corner + 3 Health + 2 Arrow
+local DRAWINGS_PER_PLAYER = 29 -- 1 Box + 1 Head + 1 Text + 14 Skeleton + 8 Corner + 2 Health + 2 Arrow
 
 -- R15 Part Indexing (1..15)
 local R15_PART_NAMES = {
@@ -346,7 +318,6 @@ local UI
 local Stats
 local Crosshair
 local Combat
-local Hitmarkers
 local Security
 
 --==============================================================================
@@ -434,7 +405,6 @@ local function GetDrawingTotal()
     if UI then total += #UI.Objects end
     if Crosshair then total += #Crosshair.Objects end
     if Combat then total += #Combat.Objects end
-    if Hitmarkers then total += #Hitmarkers.Objects end
     if Stats then total += #Stats.Objects end
     return total
 end
@@ -521,17 +491,11 @@ Bool("ShowBox"); Bool("CornerBox"); Bool("ShowSkeleton"); Bool("ShowHead"); Bool
 Bool("VisibilityCheck"); Bool("ShowCrosshair"); Bool("CrosshairDot"); Bool("TeamCheck")
 Bool("ShowStats"); Bool("AutoSave")
 Bool("HealthBar"); Bool("OffscreenArrows"); Bool("ThreatHUD"); Bool("ThreatLine")
-Bool("Hitmarker")
 Num("CrosshairSize", 2, 20, 1)
 Num("CrosshairGap", 0, 16, 1)
 Num("CrosshairDotSize", 1, 8, 1)
 Num("ArrowRadius", 60, 400, 5)
 Num("ArrowSize", 6, 24, 1)
-Num("HealthBarWidth", 3, 10, 1)
-Num("HitmarkerShape", 1, 4, 1)
-Num("HitmarkerDuration", 0.2, 3, 0.1)
-Num("HitmarkerSize", 4, 24, 1)
-Num("HitmarkerAlpha", 0, 1, 0.01)
 Num("MaxDistance", DefaultConfig.MinDistanceLimit, DefaultConfig.MaxDistanceLimit, DefaultConfig.DistanceStep)
 Num("ColorHiddenAlpha", 0, 1, 0.01)
 Num("ColorVisibleAlpha", 0, 1, 0.01)
@@ -546,7 +510,6 @@ Num("WallPenetrationLimit", 1, 8, 1)
 Num("RaycastInterval", 0.01, 0.25, 0.001)
 Num("MaxRaysPerFrame", 4, 64, 1)
 Col("ColorHidden"); Col("ColorVisible"); Col("ColorCrosshair"); Col("ColorDot")
-Col("HitmarkerColor")
 Key("UnloadKey"); Key("MenuToggleKey")
 
 function ConfigIO.IsSupported()
@@ -1504,231 +1467,7 @@ function Combat:Destroy()
 end
 
 --==============================================================================
--- 11c. Hitmarker Module (PASSIVE: fires when an enemy humanoid loses health)
---      Fixed object pool (zero per-hit allocations). Shapes: X / + / DIAMOND / CIRCLE.
---      Pops at the screen center, expands subtly, and fades out over the configured
---      lifetime. Color / alpha / shape / lifetime / size are all user-configurable.
---==============================================================================
-local HM_SHAPE_X = 1
-local HM_SHAPE_PLUS = 2
-local HM_SHAPE_DIAMOND = 3
-local HM_SHAPE_CIRCLE = 4
-
-Hitmarkers = {
-    Objects = {},
-    Pool = {},
-    PoolSize = 8,
-    Ready = false,
-}
-
-function Hitmarkers:NewDrawing(className, props)
-    local obj = Drawing.new(className)
-    table.insert(self.Objects, obj) -- tracked first: a failed property set can never leak
-    for k, v in pairs(props) do
-        obj[k] = v
-    end
-    return obj
-end
-
-function Hitmarkers:Init()
-    if self.Ready then return end
-    local ok, err = pcall(function()
-        for i = 1, self.PoolSize do
-            local marker = {
-                Active = false,
-                Start = 0,
-                Duration = 1,
-                Shape = HM_SHAPE_X,
-                Size = 10,
-                Color = Color3.fromRGB(255, 255, 255),
-                Alpha = 1,
-                LinesShown = false,
-                CircleShown = false,
-                Lines = table.create(4),
-            }
-            for j = 1, 4 do
-                marker.Lines[j] = self:NewDrawing("Line", {
-                    Thickness = 2,
-                    Color = marker.Color,
-                    Transparency = 1,
-                    ZIndex = 9,
-                    Visible = false,
-                })
-            end
-            marker.Circle = self:NewDrawing("Circle", {
-                NumSides = 24,
-                Thickness = 2,
-                Filled = false,
-                Color = marker.Color,
-                Transparency = 1,
-                ZIndex = 9,
-                Visible = false,
-            })
-            self.Pool[i] = marker
-        end
-    end)
-
-    if ok then
-        self.Ready = true
-    else
-        Health.AllocFailures += 1
-        warn("[0x] Hitmarker module failed to initialize: " .. tostring(err))
-    end
-end
-
-function Hitmarkers:Hide(marker)
-    if marker.LinesShown then
-        marker.LinesShown = false
-        for i = 1, 4 do
-            marker.Lines[i].Visible = false
-        end
-    end
-    if marker.CircleShown then
-        marker.CircleShown = false
-        marker.Circle.Visible = false
-    end
-end
-
--- Spawns a hitmarker at the screen center (steals the oldest slot when the pool is full)
-function Hitmarkers:Trigger()
-    if not self.Ready or IsUnloaded or not Config.Hitmarker then return end
-
-    local marker, oldest = nil, nil
-    for i = 1, self.PoolSize do
-        local m = self.Pool[i]
-        if not m.Active then
-            marker = m
-            break
-        end
-        if not oldest or m.Start < oldest.Start then
-            oldest = m
-        end
-    end
-    marker = marker or oldest
-    if not marker then return end
-
-    marker.Active = true
-    marker.Start = os.clock()
-    marker.Duration = math.max(Config.HitmarkerDuration, 0.05)
-    marker.Shape = Config.HitmarkerShape
-    marker.Size = Config.HitmarkerSize
-    marker.Color = Config.HitmarkerColor
-    marker.Alpha = Config.HitmarkerAlpha
-end
-
--- Called from the per-player Humanoid.HealthChanged handler (health DROP = damage dealt).
--- Best-effort attacker attribution: many games tag the attacker with an ObjectValue named
--- "creator" on the humanoid. When such a tag exists and points at someone else, the strike
--- was not ours -> no marker. Without a tag, damage is counted as ours (permissive fallback).
-function Hitmarkers:OnEnemyDamaged(hum)
-    if not Config.Hitmarker or not self.Ready or IsUnloaded then return end
-    if not hum or not hum.Parent then return end
-
-    local tag = hum:FindFirstChild("creator")
-    if tag and tag:IsA("ObjectValue") then
-        local src = tag.Value
-        local isOurs = (src == LocalPlayer) or (src == LocalPlayer.Character)
-        if not isOurs and src ~= nil and LocalPlayer.Character and src:IsDescendantOf(LocalPlayer.Character) then
-            isOurs = true
-        end
-        if not isOurs then
-            return
-        end
-    end
-
-    self:Trigger()
-end
-
-function Hitmarkers:Update(now)
-    if not self.Ready then return end
-
-    local enabled = Config.Hitmarker
-    local vp = WorldState.ViewportSize
-    local cx = math.floor(vp.X * 0.5)
-    local cy = math.floor(vp.Y * 0.5)
-
-    for i = 1, self.PoolSize do
-        local m = self.Pool[i]
-        if m.Active then
-            local t = (now - m.Start) / m.Duration
-            if not enabled or t >= 1 then
-                m.Active = false
-                self:Hide(m)
-            else
-                -- Subtle pop-out expansion + ease-out fade
-                local s = m.Size * (0.85 + 0.35 * t)
-                local g = s * 0.4 -- center gap
-                local alpha = m.Alpha * (1 - t * t)
-                if alpha < 0.02 then
-                    alpha = 0.02
-                end
-
-                if m.Shape == HM_SHAPE_CIRCLE then
-                    if m.LinesShown then
-                        self:Hide(m)
-                    end
-                    local circle = m.Circle
-                    circle.Position = Vector2.new(cx, cy)
-                    circle.Radius = s * 0.9
-                    circle.Color = m.Color
-                    circle.Transparency = alpha
-                    if not m.CircleShown then
-                        circle.Visible = true
-                        m.CircleShown = true
-                    end
-                else
-                    if m.CircleShown then
-                        m.Circle.Visible = false
-                        m.CircleShown = false
-                    end
-                    local a, b, c, d = m.Lines[1], m.Lines[2], m.Lines[3], m.Lines[4]
-                    if m.Shape == HM_SHAPE_PLUS then
-                        a.From = Vector2.new(cx, cy - g);  a.To = Vector2.new(cx, cy - s)
-                        b.From = Vector2.new(cx, cy + g);  b.To = Vector2.new(cx, cy + s)
-                        c.From = Vector2.new(cx - g, cy);  c.To = Vector2.new(cx - s, cy)
-                        d.From = Vector2.new(cx + g, cy);  d.To = Vector2.new(cx + s, cy)
-                    elseif m.Shape == HM_SHAPE_DIAMOND then
-                        a.From = Vector2.new(cx, cy - s);  a.To = Vector2.new(cx + s, cy)
-                        b.From = Vector2.new(cx + s, cy);  b.To = Vector2.new(cx, cy + s)
-                        c.From = Vector2.new(cx, cy + s);  c.To = Vector2.new(cx - s, cy)
-                        d.From = Vector2.new(cx - s, cy);  d.To = Vector2.new(cx, cy - s)
-                    else -- HM_SHAPE_X
-                        a.From = Vector2.new(cx - g, cy - g); a.To = Vector2.new(cx - s, cy - s)
-                        b.From = Vector2.new(cx + g, cy - g); b.To = Vector2.new(cx + s, cy - s)
-                        c.From = Vector2.new(cx - g, cy + g); c.To = Vector2.new(cx - s, cy + s)
-                        d.From = Vector2.new(cx + g, cy + g); d.To = Vector2.new(cx + s, cy + s)
-                    end
-                    a.Color = m.Color; a.Transparency = alpha
-                    b.Color = m.Color; b.Transparency = alpha
-                    c.Color = m.Color; c.Transparency = alpha
-                    d.Color = m.Color; d.Transparency = alpha
-                    if not m.LinesShown then
-                        a.Visible = true
-                        b.Visible = true
-                        c.Visible = true
-                        d.Visible = true
-                        m.LinesShown = true
-                    end
-                end
-            end
-        end
-    end
-end
-
-function Hitmarkers:Destroy()
-    self.Ready = false
-    for _, marker in ipairs(self.Pool) do
-        marker.Active = false
-    end
-    for _, obj in ipairs(self.Objects) do
-        SafeRemoveDrawing(obj)
-    end
-    table.clear(self.Objects)
-    table.clear(self.Pool)
-end
-
---==============================================================================
--- 11d. Security Monitor (self-audit of THIS script: integrity, limits, runtime health)
+-- 11c. Security Monitor (self-audit of THIS script: integrity, limits, runtime health)
 --      Group "SEC" -> Security %, Group "REL" -> Reliability %. Add checks with Security:Register().
 --==============================================================================
 local COLOR_GOOD = Color3.fromRGB(0, 255, 0)
@@ -1956,7 +1695,6 @@ local TargetKeys = {
     Visible   = { Color = "ColorVisible",   Alpha = "ColorVisibleAlpha",   Label = "VISIBLE COLOR" },
     Crosshair = { Color = "ColorCrosshair", Alpha = "ColorCrosshairAlpha", Label = "XHAIR COLOR" },
     Dot       = { Color = "ColorDot",       Alpha = "ColorDotAlpha",       Label = "DOT COLOR" },
-    Hitmarker = { Color = "HitmarkerColor", Alpha = "HitmarkerAlpha",      Label = "HIT COLOR" },
 }
 local CHANNEL_PROP = { R = "R", G = "G", B = "B" }
 local COLOR_DIM = Color3.fromRGB(150, 150, 150)
@@ -2264,11 +2002,7 @@ Controls.slider = {
         local maxFill = def.BarWidth - 4
         local fillW = math.floor(maxFill * alpha + 0.5)
 
-        if def.Decimals then
-            def.Label.Text = string.format("%s: %." .. def.Decimals .. "f%s", def.Text, val, def.Suffix or "")
-        else
-            def.Label.Text = string.format("%s: %d%s", def.Text, math.floor(val + 0.5), def.Suffix or "")
-        end
+        def.Label.Text = string.format("%s: %d%s", def.Text, math.floor(val + 0.5), def.Suffix or "")
         def.Fill.Size = Vector2.new(math.max(fillW, 0), 8)
 
         def.Label.Visible = visible
@@ -2670,8 +2404,8 @@ function UI:AddToggle(tabId, text, key, after)
     })
 end
 
--- Shorthand: slider bound to a Config key (decimals > 0 shows fractional values, e.g. "0.6s")
-function UI:AddSlider(tabId, text, key, min, max, step, suffix, after, decimals)
+-- Shorthand: slider bound to a Config key
+function UI:AddSlider(tabId, text, key, min, max, step, suffix, after)
     return self:AddControl(tabId, {
         Type = "slider",
         Text = text,
@@ -2679,7 +2413,6 @@ function UI:AddSlider(tabId, text, key, min, max, step, suffix, after, decimals)
         Min = min,
         Max = max,
         Step = step,
-        Decimals = decimals,
         Get = function() return Config[key] end,
         Set = function(v)
             Config[key] = v
@@ -2713,46 +2446,11 @@ function UI:BuildCombatTab()
     local T = "COMBAT"
     self:AddControl(T, { Type = "label", Text = "PASSIVE / READ-ONLY TOOLS", Color = COLOR_DIM })
     self:AddToggle(T, "HEALTH BAR", "HealthBar")
-    self:AddSlider(T, "HP BAR WIDTH", "HealthBarWidth", 3, 10, 1, "px")
     self:AddToggle(T, "OFFSCREEN ARROWS", "OffscreenArrows")
     self:AddSlider(T, "ARROW RADIUS", "ArrowRadius", 60, 400, 5, "px")
     self:AddSlider(T, "ARROW SIZE", "ArrowSize", 6, 24, 1, "px")
     self:AddToggle(T, "THREAT HUD", "ThreatHUD")
     self:AddToggle(T, "THREAT LINE", "ThreatLine")
-
-    self:AddControl(T, { Type = "label", Text = "HITMARKER (ON DAMAGE)", Color = COLOR_DIM })
-    self:AddToggle(T, "HITMARKER", "Hitmarker")
-    self:AddControl(T, {
-        Type = "buttonrow",
-        Buttons = {
-            {
-                Text = "X",
-                Mutates = true,
-                IsActive = function() return Config.HitmarkerShape == HM_SHAPE_X end,
-                OnClick = function() Config.HitmarkerShape = HM_SHAPE_X end,
-            },
-            {
-                Text = "+",
-                Mutates = true,
-                IsActive = function() return Config.HitmarkerShape == HM_SHAPE_PLUS end,
-                OnClick = function() Config.HitmarkerShape = HM_SHAPE_PLUS end,
-            },
-            {
-                Text = "DIA",
-                Mutates = true,
-                IsActive = function() return Config.HitmarkerShape == HM_SHAPE_DIAMOND end,
-                OnClick = function() Config.HitmarkerShape = HM_SHAPE_DIAMOND end,
-            },
-            {
-                Text = "CIRC",
-                Mutates = true,
-                IsActive = function() return Config.HitmarkerShape == HM_SHAPE_CIRCLE end,
-                OnClick = function() Config.HitmarkerShape = HM_SHAPE_CIRCLE end,
-            },
-        },
-    })
-    self:AddSlider(T, "HM LIFETIME", "HitmarkerDuration", 0.2, 3, 0.1, "s", nil, 1)
-    self:AddSlider(T, "HM SIZE", "HitmarkerSize", 4, 24, 1, "px")
     self:AddControl(T, { Type = "label", Text = "NO INPUT / NO REMOTES", Color = COLOR_DIM })
 end
 
@@ -2780,11 +2478,6 @@ function UI:BuildColorsTab()
                 Text = "DOT",
                 IsActive = function() return self.ColorTarget == "Dot" end,
                 OnClick = function() self.ColorTarget = "Dot" end,
-            },
-            {
-                Text = "HIT",
-                IsActive = function() return self.ColorTarget == "Hitmarker" end,
-                OnClick = function() self.ColorTarget = "Hitmarker" end,
             },
         },
     })
@@ -3538,7 +3231,6 @@ local function HideHealth(data)
     data.HealthShown = false
     data.HealthOutline.Visible = false
     data.HealthFill.Visible = false
-    data.HealthTrail.Visible = false
 end
 
 -- Hides everything attached to the character body (gated by the Hidden flag).
@@ -3751,7 +3443,7 @@ local function CreateESPObject(player)
             })
         end
 
-        -- Combat: health bar (outline + fill + damage-drain trail) and off-screen arrow (2 lines)
+        -- Combat: health bar (outline + fill) and off-screen arrow (2 lines)
         local healthOutline = TrackDrawing("Square", {
             Size = Vector2.new(4, 4),
             Color = Color3.fromRGB(0, 0, 0),
@@ -3760,20 +3452,12 @@ local function CreateESPObject(player)
             ZIndex = 0,
             Visible = false,
         })
-        local healthTrail = TrackDrawing("Square", {
-            Size = Vector2.new(2, 2),
-            Color = Color3.fromRGB(255, 255, 255),
-            Filled = true,
-            Transparency = 0.55,
-            ZIndex = 1,
-            Visible = false,
-        })
         local healthFill = TrackDrawing("Square", {
             Size = Vector2.new(2, 2),
             Color = Color3.fromRGB(0, 255, 30),
             Filled = true,
             Transparency = 1,
-            ZIndex = 2,
+            ZIndex = 1,
             Visible = false,
         })
         local arrowLines = table.create(2)
@@ -3800,15 +3484,8 @@ local function CreateESPObject(player)
             SkeletonLines = skeletonLines,
             CornerLines = cornerLines,
             HealthOutline = healthOutline,
-            HealthTrail = healthTrail,
             HealthFill = healthFill,
             ArrowLines = arrowLines,
-
-            -- Smoothed health-bar animation state (HpDisplay chases real HP, HpGhost trails it)
-            HpDisplay = 1,
-            HpGhost = 1,
-            HpAnimTime = 0,
-            PrevHealth = nil,
 
             -- Reactive Character State
             Character = nil,
@@ -3891,11 +3568,6 @@ local function CreateESPObject(player)
         data.PartCount = 0
         data.LowestIndices = nil
 
-        -- Fresh character = full HP, no stale drain animation / damage history
-        data.PrevHealth = nil
-        data.HpDisplay = 1
-        data.HpGhost = 1
-
         table.clear(data.PartArray)
         table.clear(data.JointScreen)
         data.CachedVisible = false
@@ -3909,9 +3581,6 @@ local function CreateESPObject(player)
 
         data.Humanoid = hum
         data.Alive = hum.Health > 0
-        data.PrevHealth = hum.Health
-        data.HpDisplay = 1
-        data.HpGhost = 1
 
         if not data.RigType then
             if hum.RigType == Enum.HumanoidRigType.R15 then
@@ -3921,27 +3590,18 @@ local function CreateESPObject(player)
             end
         end
 
-        data.CharConnections.Died = hum.Died:Connect(Guard("HumanoidDied", function()
+        data.CharConnections.Died = hum.Died:Connect(function()
             data.Alive = false
             HideESPData(data)
-        end))
+        end)
 
-        data.CharConnections.HealthChanged = hum.HealthChanged:Connect(Guard("HealthChanged", function(hp)
-            local prev = data.PrevHealth
-            data.PrevHealth = hp
+        data.CharConnections.HealthChanged = hum.HealthChanged:Connect(function(hp)
             local aliveNow = hp > 0
             data.Alive = aliveNow
             if not aliveNow then
                 HideESPData(data)
             end
-            -- Hitmarker: a health DROP on a valid enemy = damage landed (passive read-only)
-            if prev and hp < prev then
-                local sameTeam = Config.TeamCheck and LocalPlayer.Team ~= nil and player.Team == LocalPlayer.Team
-                if not sameTeam then
-                    Hitmarkers:OnEnemyDamaged(hum)
-                end
-            end
-        end))
+        end)
     end
 
     local function InspectChildAdded(child)
@@ -3987,7 +3647,6 @@ local function CreateESPObject(player)
             data.CharConnections.HealthChanged = nil
             data.Humanoid = nil
             data.Alive = false
-            data.PrevHealth = nil
         end
 
         local nameMap = data.NameMap
@@ -4011,16 +3670,15 @@ local function CreateESPObject(player)
         end
 
         -- Reactive listeners handle late-streamed parts & StreamingEnabled seamlessly
-        -- (Guard-wrapped: a handler error on a destroyed instance can never break the chain)
-        data.CharConnections.ChildAdded = character.ChildAdded:Connect(Guard("ChildAdded", InspectChildAdded))
-        data.CharConnections.ChildRemoved = character.ChildRemoved:Connect(Guard("ChildRemoved", InspectChildRemoved))
+        data.CharConnections.ChildAdded = character.ChildAdded:Connect(InspectChildAdded)
+        data.CharConnections.ChildRemoved = character.ChildRemoved:Connect(InspectChildRemoved)
     end
 
     data.Bind = function()
         if data.Bound or data.Destroyed or IsUnloaded then return end
         data.Bound = true
-        data.CharConnections.Added = player.CharacterAdded:Connect(Guard("CharAdded", OnCharacterAdded))
-        data.CharConnections.Removing = player.CharacterRemoving:Connect(Guard("CharRemoving", ClearCharacterState))
+        data.CharConnections.Added = player.CharacterAdded:Connect(OnCharacterAdded)
+        data.CharConnections.Removing = player.CharacterRemoving:Connect(ClearCharacterState)
         if player.Character then
             OnCharacterAdded(player.Character)
         end
@@ -4044,7 +3702,6 @@ local function RemoveESPObject(player)
     SafeRemoveDrawing(data.Head)
     SafeRemoveDrawing(data.Text)
     SafeRemoveDrawing(data.HealthOutline)
-    SafeRemoveDrawing(data.HealthTrail)
     SafeRemoveDrawing(data.HealthFill)
 
     for i = 1, 14 do
@@ -4110,7 +3767,6 @@ local function UpdateESP()
     local visCheck = Config.VisibilityCheck
     local teamCheck = Config.TeamCheck
     local showHealth = Config.HealthBar
-    local hpBarW = Config.HealthBarWidth
     local showArrows = Config.OffscreenArrows
 
     local colorVisible, colorHidden = Config.ColorVisible, Config.ColorHidden
@@ -4170,11 +3826,6 @@ local function UpdateESP()
         if showArrows and not rootOnScreen then
             local rel = cameraCFrame:PointToObjectSpace(rootPos)
             local ax, ay = rel.X, -rel.Y
-            -- Behind the camera the perspective projection flips both axes:
-            -- mirror the direction or the arrow points away from the enemy.
-            if rel.Z < 0 then
-                ax, ay = -ax, -ay
-            end
             local mag = math.sqrt(ax * ax + ay * ay)
             if mag < 1e-3 then
                 ax, ay, mag = 0, 1, 1
@@ -4356,76 +4007,37 @@ local function UpdateESP()
         end
 
         -- 3b. Health Bar (left of the box, read-only Humanoid.Health)
-        -- Smoothed fill with a "recently lost HP" ghost trail + green->yellow->red gradient.
-        -- The displayed fill eases toward real HP after damage (heals snap up instantly) and
-        -- the ghost trail falls slower behind it - showing how much HP was just lost.
         if validBounds and showHealth then
+            local ratio = 1
             local hum = data.Humanoid
             if hum then
                 local maxHp = hum.MaxHealth
-                local ratio = 1
                 if maxHp > 0 then
                     ratio = hum.Health / maxHp
                 end
-                if ratio ~= ratio then ratio = 0 end -- NaN guard
-                ratio = math.clamp(ratio, 0, 1)
+            end
+            if ratio ~= ratio then ratio = 0 end
+            ratio = math.clamp(ratio, 0, 1)
 
-                local dt = espStartClock - data.HpAnimTime
-                if dt > 0.1 then dt = 0.1 elseif dt < 0 then dt = 0 end
-                data.HpAnimTime = espStartClock
+            local fillH = math.max(math.floor(boxH * ratio + 0.5), 1)
+            data.HealthOutline.Size = Vector2.new(4, boxH + 2)
+            data.HealthOutline.Position = Vector2.new(boxX - 6, boxY - 1)
+            data.HealthFill.Size = Vector2.new(2, fillH)
+            data.HealthFill.Position = Vector2.new(boxX - 5, boxY + boxH - fillH)
 
-                local display = data.HpDisplay
-                if ratio > display then
-                    display = ratio -- heals snap up
-                else
-                    display += (ratio - display) * (dt * 5)
-                    if display < ratio + 0.002 then display = ratio end
-                end
-                local ghost = data.HpGhost
-                if display > ghost then
-                    ghost = display
-                else
-                    ghost += (display - ghost) * (dt * 2)
-                    if ghost < display + 0.002 then ghost = display end
-                end
-                data.HpDisplay = display
-                data.HpGhost = ghost
-
-                local barW = hpBarW
-                local innerW = barW - 2
-                local barX = boxX - (barW + 2)
-                local fillH = math.max(math.floor(boxH * display + 0.5), 1)
-                local ghostH = math.max(math.floor(boxH * ghost + 0.5), 1)
-
-                data.HealthOutline.Size = Vector2.new(barW, boxH + 2)
-                data.HealthOutline.Position = Vector2.new(barX, boxY - 1)
-                data.HealthTrail.Size = Vector2.new(innerW, ghostH)
-                data.HealthTrail.Position = Vector2.new(barX + 1, boxY + boxH - ghostH)
-                data.HealthFill.Size = Vector2.new(innerW, fillH)
-                data.HealthFill.Position = Vector2.new(barX + 1, boxY + boxH - fillH)
-
-                local hpInt = math.floor(display * 100 + 0.5)
-                if data.LastHp ~= hpInt then
-                    data.LastHp = hpInt
-                    -- Green (100%) -> Yellow (50%) -> Red (0%)
-                    local cr, cg
-                    if display >= 0.5 then
-                        cr = math.floor(255 * (1 - (display - 0.5) * 2) + 0.5)
-                        cg = 255
-                    else
-                        cr = 255
-                        cg = math.floor(255 * (display * 2) + 0.5)
-                    end
-                    data.HealthFill.Color = Color3.fromRGB(cr, cg, 45)
-                end
-                if not data.HealthShown then
-                    data.HealthOutline.Visible = true
-                    data.HealthTrail.Visible = true
-                    data.HealthFill.Visible = true
-                    data.HealthShown = true
-                end
-            elseif data.HealthShown then
-                HideHealth(data)
+            local hpInt = math.floor(ratio * 100 + 0.5)
+            if data.LastHp ~= hpInt then
+                data.LastHp = hpInt
+                data.HealthFill.Color = Color3.fromRGB(
+                    math.floor(255 * math.min(1, 2 * (1 - ratio))),
+                    math.floor(255 * math.min(1, 2 * ratio)),
+                    30
+                )
+            end
+            if not data.HealthShown then
+                data.HealthOutline.Visible = true
+                data.HealthFill.Visible = true
+                data.HealthShown = true
             end
         elseif data.HealthShown then
             HideHealth(data)
@@ -4502,9 +4114,9 @@ local function UpdateESP()
             local lineShown = data.LineShown
 
             for i = 1, boneCount do
-                local bone = bones[i]
-                local pA = jointScreen[bone[1]]
-                local pB = jointScreen[bone[2]]
+                local pair = bones[i]
+                local pA = jointScreen[pair[1]]
+                local pB = jointScreen[pair[2]]
                 local line = skelLines[i]
 
                 if pA and pB then
@@ -4597,8 +4209,6 @@ local function SafeFrame()
     pcall(UI.TickClock, UI)
     -- Security tab live data (re-scan once per second, only while that tab is on screen)
     pcall(Security.Tick, Security, now)
-    -- Hitmarker fade/animation (keeps fading even while the ESP is paused)
-    pcall(Hitmarkers.Update, Hitmarkers, now)
 end
 
 --==============================================================================
@@ -4632,7 +4242,6 @@ local function Unload()
 
     if Crosshair then pcall(Crosshair.Destroy, Crosshair) end
     if Combat then pcall(Combat.Destroy, Combat) end
-    if Hitmarkers then pcall(Hitmarkers.Destroy, Hitmarkers) end
     if UI then pcall(UI.Destroy, UI) end
     if Stats then pcall(Stats.Destroy, Stats) end
 
@@ -4674,7 +4283,6 @@ end)
 Crosshair:Init()
 Stats:Init()
 Combat:Init()
-Hitmarkers:Init()
 UI:Init()
 
 ConfigIO.LoadSlotMeta()
@@ -4783,10 +4391,6 @@ local Ox = {
     Stats = Stats,
     Crosshair = Crosshair,
     Combat = Combat,
-    Hitmarkers = Hitmarkers,
-
-    -- Hitmarker: Ox.TriggerHitmarker() spawns one manually (testing / external triggers)
-    TriggerHitmarker = function() Hitmarkers:Trigger() end,
 
     -- Config system
     SaveConfig = ConfigIO.Save,
@@ -4839,7 +4443,6 @@ local Ox = {
         Arrows = ToggleKey("OffscreenArrows"),
         ThreatHUD = ToggleKey("ThreatHUD"),
         ThreatLine = ToggleKey("ThreatLine"),
-        Hitmarker = ToggleKey("Hitmarker"),
     },
 }
 
